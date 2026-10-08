@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .catalog import load_catalog, reindex_topics
+
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
@@ -19,6 +21,7 @@ class Database:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.catalog = load_catalog()
 
     @contextmanager
     def connection(self, write=False):
@@ -49,6 +52,10 @@ class Database:
                 CREATE TABLE IF NOT EXISTS sessions (
                     token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
                     csrf_token TEXT NOT NULL, expires_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS admin_grants (
+                    token_hash TEXT PRIMARY KEY,
+                    session_hash TEXT NOT NULL UNIQUE REFERENCES sessions(token_hash) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS settings (
                     id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS sources (
@@ -72,6 +79,10 @@ class Database:
                     watch_id INTEGER NOT NULL REFERENCES watches(id) ON DELETE CASCADE,
                     PRIMARY KEY(article_id,watch_id));
                 CREATE INDEX IF NOT EXISTS hits_watch ON article_watches(watch_id,article_id);
+                CREATE TABLE IF NOT EXISTS article_topics (
+                    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                    topic_id TEXT NOT NULL, PRIMARY KEY(article_id,topic_id));
+                CREATE INDEX IF NOT EXISTS topics_filter ON article_topics(topic_id,article_id);
                 CREATE TABLE IF NOT EXISTS schedules (
                     id INTEGER PRIMARY KEY, name TEXT NOT NULL, time TEXT NOT NULL,
                     days TEXT NOT NULL, categories TEXT NOT NULL, enabled INTEGER NOT NULL,
@@ -86,6 +97,9 @@ class Database:
                     PRIMARY KEY(schedule_id,scheduled_at));
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
+            watch_columns = {row["name"] for row in conn.execute("PRAGMA table_info(watches)")}
+            if "league_id" not in watch_columns:
+                conn.execute("ALTER TABLE watches ADD COLUMN league_id TEXT NOT NULL DEFAULT ''")
             conn.execute("INSERT OR IGNORE INTO settings(id,value) VALUES(1,?)", (json.dumps(DEFAULT_SETTINGS),))
             conn.execute("UPDATE runs SET status='interrupted',finished_at=?,error=? WHERE status='running'",
                          (utc_now(), "服务重启中断了此次采集；已保存的文章仍然保留"))
@@ -100,6 +114,12 @@ class Database:
                                      (source["name"], source.get("kind", "rss"), source["url"], source["category"],
                                       int(source.get("enabled", True)), source.get("steam_appid")))
                 conn.execute("INSERT INTO metadata(key,value) VALUES('sources_seeded','1')")
+            conn.execute("DELETE FROM admin_grants WHERE expires_at<=?", (utc_now(),))
+            conn.execute("DELETE FROM sessions WHERE expires_at<=?", (utc_now(),))
+            if reindex_topics(conn, self.catalog):
+                from .collector import rematch_watch
+                for watch in conn.execute("SELECT id FROM watches WHERE type='league' AND league_id<>''"):
+                    rematch_watch(conn, watch["id"], self.catalog)
             conn.commit()
 
     def settings(self):

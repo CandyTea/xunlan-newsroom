@@ -1,0 +1,47 @@
+{
+  "companies": [
+    {"id":"tencent","name":"腾讯","aliases":["腾讯控股","Tencent"],"ticker":"","market":""},
+    {"id":"alibaba","name":"阿里巴巴","aliases":["阿里巴巴集团","Alibaba"],"ticker":"","market":""},
+    {"id":"apple","name":"苹果公司","aliases":["苹果","Apple","Apple Inc"],"ticker":"","market":""},
+    {"id":"nvidia","name":"英伟达","aliases":["NVIDIA","辉达"],"ticker":"","market":""},
+    {"id":"microsoft","name":"微软","aliases":["Microsoft"],"ticker":"","market":""},
+    {"id":"sony","name":"索尼","aliases":["Sony","索尼集团"],"ticker":"","market":""},
+    {"id":"nintendo","name":"任天堂","aliases":["Nintendo"],"ticker":"","market":""}
+  ],
+  "leagues": [
+    {"id":"nba","name":"NBA","aliases":["美国职业篮球联赛","National Basketball Association"]},
+    {"id":"premier-league","name":"英超","aliases":["英格兰足球超级联赛","Premier League","EPL"]},
+    {"id":"la-liga","name":"西甲","aliases":["西班牙足球甲级联赛","La Liga","LaLiga"]}
+  ],
+  "teams": [
+    {"id":"golden-state-warriors","league_id":"nba","name":"金州勇士","aliases":["勇士队","勇士","Golden State Warriors"]},
+    {"id":"los-angeles-lakers","league_id":"nba","name":"洛杉矶湖人","aliases":["湖人","Los Angeles Lakers","LA Lakers"]},
+    {"id":"boston-celtics","league_id":"nba","name":"波士顿凯尔特人","aliases":["凯尔特人","Boston Celtics"]},
+    {"id":"houston-rockets","league_id":"nba","name":"休斯顿火箭","aliases":["火箭队","Houston Rockets"]},
+    {"id":"dallas-mavericks","league_id":"nba","name":"达拉斯独行侠","aliases":["独行侠","Dallas Mavericks"]},
+    {"id":"chicago-bulls","league_id":"nba","name":"芝加哥公牛","aliases":["公牛队","Chicago Bulls"]},
+    {"id":"miami-heat","league_id":"nba","name":"迈阿密热火","aliases":["热火","Miami Heat"]},
+    {"id":"brooklyn-nets","league_id":"nba","name":"布鲁克林篮网","aliases":["篮网","Brooklyn Nets"]},
+    {"id":"new-york-knicks","league_id":"nba","name":"纽约尼克斯","aliases":["尼克斯","New York Knicks"]},
+    {"id":"milwaukee-bucks","league_id":"nba","name":"密尔沃基雄鹿","aliases":["雄鹿","Milwaukee Bucks"]},
+    {"id":"oklahoma-city-thunder","league_id":"nba","name":"俄克拉荷马城雷霆","aliases":["雷霆队","Oklahoma City Thunder","OKC Thunder"]},
+    {"id":"san-antonio-spurs","league_id":"nba","name":"圣安东尼奥马刺","aliases":["马刺","San Antonio Spurs"]},
+    {"id":"arsenal","league_id":"premier-league","name":"阿森纳","aliases":["Arsenal"]},
+    {"id":"liverpool","league_id":"premier-league","name":"利物浦","aliases":["Liverpool","Liverpool FC"]},
+    {"id":"manchester-city","league_id":"premier-league","name":"曼城","aliases":["曼彻斯特城","Manchester City","Man City"]},
+    {"id":"manchester-united","league_id":"premier-league","name":"曼联","aliases":["曼彻斯特联","Manchester United","Man United","Man Utd"]},
+    {"id":"chelsea","league_id":"premier-league","name":"切尔西","aliases":["Chelsea"]},
+    {"id":"tottenham-hotspur","league_id":"premier-league","name":"托特纳姆热刺","aliases":["热刺","Tottenham Hotspur","Tottenham"]},
+    {"id":"newcastle-united","league_id":"premier-league","name":"纽卡斯尔联","aliases":["纽卡斯尔","Newcastle United"]},
+    {"id":"aston-villa","league_id":"premier-league","name":"阿斯顿维拉","aliases":["阿斯顿维拉队","Aston Villa"]},
+    {"id":"real-madrid","league_id":"la-liga","name":"皇家马德里","aliases":["皇马","Real Madrid"]},
+    {"id":"fc-barcelona","league_id":"la-liga","name":"巴塞罗那","aliases":["巴萨","FC Barcelona","Barcelona"]},
+    {"id":"atletico-madrid","league_id":"la-liga","name":"马德里竞技","aliases":["马竞","Atlético Madrid","Atletico Madrid","Atlético de Madrid","Atletico de Madrid"]},
+    {"id":"sevilla","league_id":"la-liga","name":"塞维利亚","aliases":["Sevilla","Sevilla FC"]},
+    {"id":"valencia","league_id":"la-liga","name":"瓦伦西亚","aliases":["巴伦西亚","Valencia","Valencia CF"]},
+    {"id":"villarreal","league_id":"la-liga","name":"比利亚雷亚尔","aliases":["Villarreal","Villarreal CF"]},
+    {"id":"athletic-club","league_id":"la-liga","name":"毕尔巴鄂竞技","aliases":["Athletic Club","Athletic Bilbao"]},
+    {"id":"real-sociedad","league_id":"la-liga","name":"皇家社会","aliases":["Real Sociedad"]},
+    {"id":"real-betis","league_id":"la-liga","name":"皇家贝蒂斯","aliases":["皇家贝迪斯","Real Betis"]}
+  ]
+}

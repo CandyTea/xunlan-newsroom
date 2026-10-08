@@ -15,6 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 
+from .catalog import article_topics, term_matches
 from .db import utc_now
 from .models import public_url_syntax
 
@@ -84,24 +85,23 @@ def parse_date(value):
         return None
 
 
-def term_matches(text, term):
-    term = term.strip()
-    if not term:
-        return False
-    escaped = re.escape(term)
-    if re.search(r"[A-Za-z0-9]", term) and not re.search(r"[\u3400-\u9fff]", term):
-        escaped = r"(?<![A-Za-z0-9_])" + escaped + r"(?![A-Za-z0-9_])"
-    return re.search(escaped, text, re.I) is not None
-
-
-def matches_watch(article, watch):
+def matches_watch(article, watch, catalog=None):
     if not watch["enabled"]:
         return False
     text = article["title"] + " " + article["summary"]
     if any(term_matches(text, term) for term in watch["exclude_keywords"]):
         return False
+    league_id = watch.get("league_id", "")
+    if league_id and article.get("category") != "sports":
+        return False
     names = [watch["name"], watch["ticker"], *watch["aliases"]]
-    return any(term_matches(text, name) for name in names) and all(term_matches(text, term) for term in watch["keywords"])
+    if watch.get("type") == "league" and league_id:
+        if catalog is None:
+            raise ValueError("预设联赛匹配需要已加载的兴趣目录")
+        matched = "league:" + league_id in article_topics(article, catalog)
+    else:
+        matched = any(term_matches(text, name) for name in names)
+    return matched and all(term_matches(text, term) for term in watch["keywords"])
 
 
 def watch_from_row(row):
@@ -112,15 +112,15 @@ def watch_from_row(row):
     return watch
 
 
-def rematch_watch(conn, watch_id):
+def rematch_watch(conn, watch_id, catalog=None):
     row = conn.execute("SELECT * FROM watches WHERE id=?", (watch_id,)).fetchone()
     if row is None:
         return
     watch = watch_from_row(row)
     conn.execute("DELETE FROM article_watches WHERE watch_id=?", (watch_id,))
     if watch["enabled"]:
-        for article in conn.execute("SELECT id,title,summary FROM articles"):
-            if matches_watch(article, watch):
+        for article in conn.execute("SELECT id,title,summary,category FROM articles"):
+            if matches_watch(dict(article), watch, catalog):
                 conn.execute("INSERT INTO article_watches(article_id,watch_id) VALUES(?,?)", (article["id"], watch_id))
 
 
@@ -335,6 +335,7 @@ class Collector:
                 return 0
             watches = [watch_from_row(row) for row in conn.execute("SELECT * FROM watches WHERE enabled=1")]
             for article in articles:
+                article = {**article, "category": source["category"]}
                 inserted = conn.execute("""INSERT OR IGNORE INTO articles(canonical_url,title,url,summary,source_id,
                     source_name,category,published_at,fetched_at,image_url) VALUES(?,?,?,?,?,?,?,?,?,?)""",
                     (article["canonical_url"], article["title"], article["url"], article["summary"], source["id"],
@@ -342,8 +343,10 @@ class Collector:
                 if not inserted.rowcount:
                     continue
                 count += 1
+                conn.executemany("INSERT INTO article_topics(article_id,topic_id) VALUES(?,?)",
+                                 [(inserted.lastrowid, topic) for topic in article_topics(article, self.db.catalog)])
                 for watch in watches:
-                    if matches_watch(article, watch):
+                    if matches_watch(article, watch, self.db.catalog):
                         conn.execute("INSERT INTO article_watches(article_id,watch_id) VALUES(?,?)", (inserted.lastrowid, watch["id"]))
             conn.execute("UPDATE sources SET last_success_at=?,last_error=NULL WHERE id=?", (utc_now(), source["id"]))
         return count

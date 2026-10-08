@@ -23,7 +23,7 @@ class Setup(Credentials):
 
 
 class Watch(StrictModel):
-    type: Literal["company", "studio", "team", "country", "politician"]
+    type: Literal["company", "studio", "team", "league", "country", "politician"]
     name: str = Field(min_length=1, max_length=120)
     aliases: list[str] = Field(default_factory=list, max_length=30)
     keywords: list[str] = Field(default_factory=list, max_length=30)
@@ -31,8 +31,9 @@ class Watch(StrictModel):
     enabled: bool = True
     market: str = Field(default="", max_length=30)
     ticker: str = Field(default="", max_length=30)
+    league_id: str = Field(default="", max_length=80)
 
-    @field_validator("name", "market", "ticker")
+    @field_validator("name", "market", "ticker", "league_id")
     @classmethod
     def trim(cls, value, info):
         value = value.strip()
@@ -46,6 +47,12 @@ class Watch(StrictModel):
         if any(not value.strip() or len(value) > 120 for value in values):
             raise ValueError("每个关键词应为 1–120 个字符")
         return list(dict.fromkeys(value.strip() for value in values))
+
+    @model_validator(mode="after")
+    def league_for_team(self):
+        if self.league_id and self.type not in ("team", "league"):
+            raise ValueError("只有球队或联赛关注可以指定联赛选项")
+        return self
 
 
 class Schedule(StrictModel):

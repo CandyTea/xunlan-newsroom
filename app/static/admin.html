@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="robots" content="noindex,nofollow">
+  <title>收取管理 · 讯览</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/admin.js" defer></script>
+</head>
+<body class="admin-page">
+  <a class="skip-link" href="#admin-main">跳到内容</a>
+  <div id="admin-boot" class="boot" role="status"><span class="brand">讯览<span class="brand-dot">·</span></span><p>正在验证登录状态…</p></div>
+  <section id="admin-auth" class="auth-page" hidden>
+    <div class="auth-heading"><a class="brand" href="/" aria-label="返回讯览">讯览<span class="brand-dot">·</span></a><p>个人资讯阅读室</p></div>
+    <div class="auth-box">
+      <h1 id="admin-auth-title">请先登录</h1>
+      <p id="admin-auth-description" class="muted">登录阅读室后，再验证收取管理权限。</p>
+      <div id="reader-login-required"><a class="button button-primary" href="/">登录阅读室</a></div>
+      <form id="admin-login-form" hidden>
+        <label>当前账号<input id="admin-username" name="username" readonly autocomplete="username"></label>
+        <label>账号密码<input id="admin-password" name="password" type="password" required maxlength="256" autocomplete="current-password" placeholder="再次输入当前账号的密码"></label>
+        <p id="admin-auth-error" class="form-error" role="alert" hidden></p>
+        <button id="admin-login-submit" class="button button-primary" type="submit">验证并进入</button>
+      </form>
+      <a class="auth-back" href="/">返回阅读室</a>
+    </div>
+  </section>
+  <div id="admin-app" class="admin-shell" hidden>
+    <header class="admin-masthead"><a class="brand" href="/" aria-label="返回讯览">讯览<span class="brand-dot">·</span></a><div class="admin-header-actions"><a class="button button-small" href="/">返回阅读室</a><button id="admin-lock" class="button button-small" type="button">锁定管理</button></div></header>
+    <div class="admin-access-note"><span>收取管理</span><span id="admin-expiry"></span></div>
+    <main id="admin-main" tabindex="-1"></main>
+    <footer class="admin-footer">公开来源 · 不绕过付费墙 · 原始报道可追溯</footer>
+  </div>
+  <dialog id="modal" class="modal" aria-labelledby="modal-title"><div class="modal-header"><h2 id="modal-title"></h2><button id="modal-close" class="icon-button" type="button" aria-label="关闭窗口">×</button></div><div id="modal-body" class="modal-body"></div></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <noscript><div class="no-script">需要启用 JavaScript 才能验证登录状态。</div></noscript>
+</body>
+</html>

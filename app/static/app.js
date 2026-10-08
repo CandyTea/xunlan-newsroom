@@ -1,7 +1,7 @@
 "use strict";
 
 const CATEGORIES = { games: "游戏", sports: "体育", stocks: "股票", politics: "政治" };
-const WATCH_TYPES = { company: "公司", studio: "游戏工作室", team: "球队", country: "国家", politician: "政客" };
+const WATCH_TYPES = { company: "公司", studio: "游戏工作室", league: "联赛", team: "球队", country: "国家", politician: "政客" };
 const WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 const ICONS = {
   news: '<rect x="3" y="4" width="18" height="16" rx="1"/><path d="M7 8h6v5H7zM16 8h2M16 12h2M7 16h11"/>',
@@ -26,7 +26,7 @@ const ICONS = {
   warning: '<path d="m12 3 10 18H2zM12 9v5M12 17v.1"/>',
   chevron: '<path d="m9 5 7 7-7 7"/>',
 };
-const state = { session: null, view: "news", category: "", q: "", saved: false, unread: false, watchId: "", page: 1, articles: [], total: 0, pageSize: 20, watches: [], sources: [], schedules: [], settings: { timezone: "Asia/Shanghai", catch_up: true, catch_up_hours: 4 }, status: {}, manageWatches: false, renderId: 0, modalId: 0, toastTimer: null, fetching: false, pollBusy: false };
+const state = { session: null, view: "news", category: "", q: "", saved: false, unread: false, watchId: "", companyId: "", leagueId: "", teamId: "", sportsWatchId: "", page: 1, articles: [], total: 0, pageSize: 20, watches: [], catalog: { companies: [], leagues: [], teams: [] }, schedules: [], settings: { timezone: "Asia/Shanghai" }, status: {}, manageWatches: false, renderId: 0, modalId: 0, toastTimer: null, fetching: false, pollBusy: false };
 const $ = (selector, root = document) => root.querySelector(selector);
 const main = $("#main-content");
 const modal = $("#modal");
@@ -149,7 +149,7 @@ function showAuth() {
   $("#boot").hidden = true; $("#app").hidden = true; $("#auth").hidden = false;
   const setup = state.session?.setup_required;
   $("#auth-title").textContent = setup ? "建立你的阅读室" : "欢迎回来";
-  $("#auth-description").textContent = setup ? "创建管理员账号，再选择来源与关注对象。" : "登录，继续阅读你关注的资讯。";
+  $("#auth-description").textContent = setup ? "创建你的账号，再选择感兴趣的公司、联赛与球队。" : "登录，继续阅读你关注的资讯。";
   $("#auth-submit").textContent = setup ? "创建账号" : "登录";
   $("#auth-password").autocomplete = setup ? "new-password" : "current-password";
   $("#auth-password").minLength = setup ? 8 : 1;
@@ -160,24 +160,28 @@ function showAuth() {
   if (state.session?.username) $("#auth-username").value = state.session.username;
 }
 async function refreshData() {
-  const results = await Promise.allSettled([api("/settings"), api("/watches"), api("/status")]);
+  const results = await Promise.allSettled([api("/preferences"), api("/watches"), api("/status"), api("/catalog")]);
   if (!state.session?.authenticated) return;
   if (results[0].status === "fulfilled") state.settings = results[0].value;
   if (results[1].status === "fulfilled") state.watches = results[1].value.items || [];
   if (results[2].status === "fulfilled") state.status = results[2].value;
+  if (results[3].status === "fulfilled") state.catalog = results[3].value;
+  normalizeFocus();
   renderSidebar(); updateFetchButtons();
 }
 async function enterApp() {
   $("#boot").hidden = true; $("#auth").hidden = true; $("#app").hidden = false;
   await refreshData(); if (!state.session?.authenticated) return;
+  restoreFocus();
   route();
 }
 function route() {
   const next = location.hash.slice(1); state.view = ["news", "following", "schedules", "settings"].includes(next) ? next : "news";
-  state.page = 1; state.watchId = ""; state.manageWatches = false;
+  state.page = 1; state.watchId = ""; state.q = ""; state.saved = false; state.unread = false; state.manageWatches = false;
+  if (state.view === "news") restoreFocus(); else state.category = "";
   closeModal(); renderView();
   document.querySelectorAll("[data-view]").forEach(link => { if (link.dataset.view === state.view) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current"); });
-  document.title = `${{ news: "新闻", following: "我的关注", schedules: "收取计划", settings: "设置与来源" }[state.view]} · 讯览`;
+  document.title = `${{ news: "新闻", following: "我的关注", schedules: "收取计划", settings: "设置" }[state.view]} · 讯览`;
 }
 async function renderView() {
   if (!state.session?.authenticated) return;
@@ -186,11 +190,86 @@ async function renderView() {
   if (state.view === "schedules") return renderSchedules(id);
   return renderSettings(id);
 }
-function setFilter(key, value) { state[key] = value; state.page = 1; renderView(); }
+function setFilter(key, value) {
+  if (key === "category" && value !== state.category) { state.companyId = ""; state.leagueId = ""; state.teamId = ""; state.sportsWatchId = ""; }
+  state[key] = value; state.page = 1; if (state.view === "news") persistFocus(); renderView();
+}
+function focusStorageKey() { return `xunlan.focus.${encodeURIComponent(state.session?.username || "")}`; }
+function normalizeFocus() {
+  if (!state.watches.some(w => w.type === "company" && w.enabled && String(w.id) === state.companyId)) state.companyId = "";
+  if (!state.catalog.leagues.some(l => l.id === state.leagueId)) state.leagueId = "";
+  if (!state.catalog.teams.some(t => t.id === state.teamId && (!state.leagueId || t.league_id === state.leagueId))) state.teamId = "";
+  const sportsWatch = state.watches.find(w => ["team", "league"].includes(w.type) && w.enabled && String(w.id) === state.sportsWatchId);
+  if (!sportsWatch) state.sportsWatchId = "";
+  else if (sportsWatch.type === "league" && sportsWatch.league_id) { state.leagueId = sportsWatch.league_id; state.sportsWatchId = ""; }
+  else if (sportsWatch.type === "league") { state.leagueId = ""; state.teamId = ""; }
+  else { state.leagueId = sportsWatch.league_id || ""; state.teamId = ""; }
+  if (state.teamId) state.leagueId = state.catalog.teams.find(t => t.id === state.teamId)?.league_id || "";
+  if (state.category !== "sports") { state.leagueId = ""; state.teamId = ""; state.sportsWatchId = ""; } else state.companyId = "";
+}
+function persistFocus() {
+  try { localStorage.setItem(focusStorageKey(), JSON.stringify({ category: state.category, company_id: state.companyId, league_id: state.leagueId, team_id: state.teamId, sports_watch_id: state.sportsWatchId })); } catch { /* Storage may be unavailable in a private browser. */ }
+}
+function restoreFocus() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(focusStorageKey()) || "{}");
+    state.category = Object.hasOwn(CATEGORIES, stored.category) ? stored.category : "";
+    state.companyId = String(stored.company_id || ""); state.leagueId = String(stored.league_id || ""); state.teamId = String(stored.team_id || ""); state.sportsWatchId = String(stored.sports_watch_id || "");
+  } catch { state.category = ""; state.companyId = ""; state.leagueId = ""; state.teamId = ""; state.sportsWatchId = ""; }
+  normalizeFocus(); persistFocus();
+}
+function clearFilters() { state.q = ""; state.saved = false; state.unread = false; state.watchId = ""; state.category = ""; state.companyId = ""; state.leagueId = ""; state.teamId = ""; state.sportsWatchId = ""; state.page = 1; if (state.view === "news") persistFocus(); renderView(); }
+function setFocus(values) { Object.assign(state, values); state.page = 1; normalizeFocus(); persistFocus(); renderView(); }
+function matchingWatch(preset, type) {
+  const names = new Set([preset.name, ...(preset.aliases || [])].map(name => String(name).toLocaleLowerCase()));
+  return state.watches.find(w => w.enabled && w.type === type && [w.name, ...(w.aliases || [])].some(name => names.has(String(name).toLocaleLowerCase())));
+}
+function focusBar() {
+  if (state.category === "sports") return sportsFocusBar();
+  const companies = state.watches.filter(w => w.enabled && w.type === "company");
+  const chooser = select("company_focus", { "": "全部公司", ...Object.fromEntries(companies.map(w => [w.id, w.name])) }, state.companyId, { onchange: event => setFocus({ companyId: event.target.value }), "aria-label": "公司焦点" });
+  return el("section", { class: "focus-bar", "aria-label": "公司焦点" }, [formField("公司焦点", chooser), button("添加公司", companyPicker, "button button-small", "plus"), el("p", { class: "focus-hint", text: companies.length ? "切换你关注的公司，集中阅读相关报道。" : "从常用公司中选择，也可以添加自己的关注。" })]);
+}
+function companyPicker() {
+  const box = el("div", { class: "preset-picker" }, [el("p", { class: "field-caption", text: "选择公司添加到关注，中文与英文别名会一并填入。" })]);
+  box.append(el("div", { class: "preset-list" }, state.catalog.companies.map(company => {
+    const existing = matchingWatch(company, "company");
+    return button(company.name, () => {
+      if (existing) { closeModal(); setFocus({ companyId: String(existing.id) }); }
+      else watchForm({ ...company, id: undefined, type: "company", enabled: true }, saved => { setFocus({ companyId: String(saved.id) }); });
+    }, "preset-option", null, { "aria-label": existing ? `选择已关注公司 ${company.name}` : `添加公司 ${company.name}` });
+  })));
+  box.append(button("自定义公司", () => watchForm({ type: "company" }, saved => { setFocus({ companyId: String(saved.id) }); }), "button", "plus"));
+  openModal("选择关注公司", box);
+}
+function sportsFocusBar() {
+  const customLeague = state.watches.find(w => String(w.id) === state.sportsWatchId && w.type === "league");
+  const leagueOptions = { "": "全部联赛", ...Object.fromEntries(state.catalog.leagues.map(l => [`catalog:${l.id}`, l.name])), ...Object.fromEntries(state.watches.filter(w => w.enabled && w.type === "league" && !w.league_id).map(w => [`watch:${w.id}`, `${w.name}（自定义）`])) };
+  const selectedLeague = customLeague ? `watch:${customLeague.id}` : state.leagueId ? `catalog:${state.leagueId}` : "";
+  const leagueSelect = select("league_focus", leagueOptions, selectedLeague, { "aria-label": "联赛", onchange: event => {
+    const value = event.target.value;
+    setFocus({ leagueId: value.startsWith("catalog:") ? value.slice(8) : "", teamId: "", sportsWatchId: value.startsWith("watch:") ? value.slice(6) : "" });
+  } });
+  const teams = state.catalog.teams.filter(t => !state.leagueId || t.league_id === state.leagueId);
+  const customTeams = state.watches.filter(w => w.enabled && w.type === "team" && (!state.leagueId || w.league_id === state.leagueId));
+  const teamOptions = { "": "全部球队", ...Object.fromEntries(teams.map(t => [`catalog:${t.id}`, t.name])), ...Object.fromEntries(customTeams.map(w => [`watch:${w.id}`, `${w.name}（关注）`])) };
+  const customTeam = customTeams.find(w => String(w.id) === state.sportsWatchId);
+  const selectedTeam = customTeam ? `watch:${customTeam.id}` : state.teamId ? `catalog:${state.teamId}` : "";
+  const teamSelect = select("team_focus", teamOptions, selectedTeam, { "aria-label": "常用球队", disabled: Boolean(customLeague), onchange: event => {
+    const value = event.target.value;
+    const team = state.catalog.teams.find(t => t.id === value.slice(8));
+    setFocus({ teamId: value.startsWith("catalog:") ? value.slice(8) : "", leagueId: value.startsWith("catalog:") && team ? team.league_id : state.leagueId, sportsWatchId: value.startsWith("watch:") ? value.slice(6) : "" });
+  } });
+  const current = state.teamId ? state.catalog.teams.find(t => t.id === state.teamId) : state.leagueId ? state.catalog.leagues.find(l => l.id === state.leagueId) : null;
+  const type = state.teamId ? "team" : "league";
+  const already = current && matchingWatch(current, type);
+  const addCurrent = current ? button(already ? "已关注" : `关注${current.name}`, () => watchForm({ ...current, id: undefined, type, league_id: type === "team" ? current.league_id : current.id, enabled: true }), "button button-small", "bookmark", { disabled: Boolean(already) }) : null;
+  return el("section", { class: "focus-bar sports-focus", "aria-label": "体育焦点" }, [el("div", { class: "focus-fields" }, [formField("联赛", leagueSelect), formField("常用球队", teamSelect)]), el("div", { class: "focus-actions" }, [addCurrent, button("添加球队", () => watchForm({ type: "team", league_id: state.leagueId, enabled: true }, saved => setFocus({ teamId: "", sportsWatchId: String(saved.id) })), "button button-small", "plus")]), el("p", { class: "focus-hint", text: customLeague ? "当前按已关注联赛匹配；也可切换到上方预设联赛浏览常用球队。" : "常用球队仅供快捷选择；更多球队可以自行添加。" })]);
+}
 function readerEmpty() {
-  if (state.q || state.saved || state.unread || state.watchId || state.category) return empty("还没有符合条件的资讯", "试试其他栏目或关键词，也可以清除筛选查看已收取的全部资讯。", [button("清除筛选", () => { state.q = ""; state.saved = false; state.unread = false; state.watchId = ""; state.category = ""; state.page = 1; renderView(); }, "button button-small")]);
+  if (state.q || state.saved || state.unread || state.watchId || state.category || (state.view === "news" && (state.companyId || state.leagueId || state.teamId || state.sportsWatchId))) return empty("还没有符合条件的资讯", "试试其他栏目、公司或球队，也可以清除筛选查看已收取的全部资讯。", [button("清除筛选", clearFilters, "button button-small")]);
   if (state.view === "following") return empty(state.watches.length ? "等待你的关注资讯" : "从一个关注对象开始", state.watches.length ? "目前还没有资讯命中关注对象。收取新资讯，或编辑别名与上下文关键词来调整匹配。" : "添加公司、工作室、球队、国家或政客。讯览会从真实资讯中找出相关报道。", [button(state.watches.length ? "管理关注" : "添加关注", () => state.watches.length ? showWatchManager() : watchForm(), "button button-primary", "plus"), state.watches.length && button("收取资讯", () => requestFetch(), "button", "refresh")].filter(Boolean), "bookmark");
-  return empty("阅读室已准备好", "添加你信任的资讯来源，再收取第一批报道。你也可以先设置关注对象与每天的收取时间。", [button("收取资讯", () => requestFetch(), "button button-primary", "refresh"), button("管理来源", () => { location.hash = "settings"; }, "button")]);
+  return empty("阅读室已准备好", "收取第一批报道，或先添加感兴趣的公司、联赛与球队，再设置每天的收取时间。", [button("收取资讯", () => requestFetch(), "button button-primary", "refresh"), button("添加关注", () => watchForm(), "button", "plus")]);
 }
 async function renderReader(id) {
   const following = state.view === "following";
@@ -205,10 +284,16 @@ async function renderReader(id) {
     tools.append(watchSelect);
   }
   const list = el("div", { id: "reader-list", "aria-live": "polite" }, loading("正在载入资讯…"));
-  main.replaceChildren(head, following && !state.watches.length ? el("div", { class: "following-intro" }, [el("p", {}, [el("strong", { text: "还没有关注对象" }), " · 添加关注后，相关资讯会出现在这里。"]), button("添加", () => watchForm(), "button button-small", "plus")]) : "", categories, tools, list);
+  main.replaceChildren(head, following && !state.watches.length ? el("div", { class: "following-intro" }, [el("p", {}, [el("strong", { text: "还没有关注对象" }), " · 添加关注后，相关资讯会出现在这里。"]), button("添加", () => watchForm(), "button button-small", "plus")]) : "", categories, !following && focusBar(), tools, list);
   try {
     const params = new URLSearchParams({ page: String(state.page), page_size: String(state.pageSize), following: String(following), saved: String(state.saved), unread: String(state.unread) });
     if (state.category) params.set("category", state.category); if (state.q) params.set("q", state.q); if (state.watchId) params.set("watch_id", state.watchId);
+    if (!following) {
+      if (state.category === "sports") {
+        if (state.sportsWatchId) params.set("watch_id", state.sportsWatchId);
+        else { if (state.leagueId) params.set("league_id", state.leagueId); if (state.teamId) params.set("team_id", state.teamId); }
+      } else if (state.companyId) params.set("company_id", state.companyId);
+    }
     const data = await api(`/articles?${params}`); if (id !== state.renderId) return;
     state.articles = data.items || []; state.total = data.total || 0;
     if (!state.articles.length) { list.replaceChildren(readerEmpty()); return; }
@@ -271,25 +356,41 @@ async function renderWatches(id) {
   } catch (error) { if (id === state.renderId && error.status !== 401) main.lastElementChild.replaceWith(errorPanel(error, renderView)); }
 }
 function watchRow(watch) {
-  const details = [watch.aliases?.length ? `别名：${watch.aliases.join("、")}` : "未设置别名", watch.keywords?.length ? `上下文（需全部命中）：${watch.keywords.join("、")}` : "", watch.exclude_keywords?.length ? `排除：${watch.exclude_keywords.join("、")}` : "", watch.ticker ? `证券：${watch.market || ""} ${watch.ticker}`.trim() : ""].filter(Boolean);
+  const details = [watch.aliases?.length ? `别名：${watch.aliases.join("、")}` : "未设置别名", watch.league_id ? `绑定联赛：${state.catalog.leagues.find(l => l.id === watch.league_id)?.name || watch.league_id}` : "", watch.keywords?.length ? `上下文（需全部命中）：${watch.keywords.join("、")}` : "", watch.exclude_keywords?.length ? `排除：${watch.exclude_keywords.join("、")}` : "", watch.ticker ? `证券：${watch.market || ""} ${watch.ticker}`.trim() : ""].filter(Boolean);
   return el("article", { class: "manage-row" }, [el("div", { class: "manage-copy" }, [el("h3", { class: watch.enabled ? "" : "disabled-text" }, [watch.name, el("span", { class: "manage-type", text: WATCH_TYPES[watch.type] || watch.type })]), ...details.map(text => el("p", { text })), el("span", { class: `enabled-label${watch.enabled ? "" : " off"}`, text: watch.enabled ? "正在关注" : "已停用" })]), el("div", { class: "row-actions" }, [button("", () => watchForm(watch), "icon-button", "edit", { "aria-label": `编辑关注 ${watch.name}` }), button("", () => confirmDelete("删除关注", `删除「${watch.name}」及其匹配关系，已收取的资讯会保留。`, () => api(`/watches/${watch.id}`, { method: "DELETE" })), "icon-button", "trash", { "aria-label": `删除关注 ${watch.name}` })])]);
 }
-function watchForm(watch = {}) {
-  const form = el("form", { class: "modal-form" });
-  form.append(el("p", { class: "field-caption", text: "名称、别名或证券代码命中任意一个即可；设置上下文后，还需同时命中全部上下文关键词。任意排除词命中都会排除该资讯。" }), el("div", { class: "form-row" }, [formField("对象类型", select("type", WATCH_TYPES, watch.type || "company")), formField("名称", input("name", watch.name || "", { required: true, maxlength: 120, placeholder: "如：任天堂" }))]), formField("别名", el("textarea", { name: "aliases", rows: 2, maxlength: 2000, placeholder: "如：Nintendo，任天堂株式会社", text: (watch.aliases || []).join("\n") }), "用逗号、分号或换行分隔；含逗号的名称请使用简短别名。"), formField("上下文关键词（可选）", input("keywords", (watch.keywords || []).join("，"), { maxlength: 2000, placeholder: "如：游戏，主机" }), "用于避免同名误匹配。填写多个词时，资讯需同时包含全部关键词；用逗号、分号或换行分隔。"), formField("排除关键词（可选）", input("exclude_keywords", (watch.exclude_keywords || []).join("，"), { maxlength: 2000, placeholder: "命中任意排除词的资讯将被排除" })), el("div", { class: "form-row" }, [formField("市场（可选）", input("market", watch.market || "", { maxlength: 30, placeholder: "如：NASDAQ、港股" })), formField("证券代码（可选）", input("ticker", watch.ticker || "", { maxlength: 30, placeholder: "如：AAPL、0700" }))]), check("enabled", "启用此关注对象", watch.enabled !== false), formFooter(watch.id ? "保存修改" : "添加关注"));
+function watchForm(watch = {}, onSaved = null) {
+  const type = select("type", WATCH_TYPES, watch.type || "company");
+  const league = select("league_id", { "": "不绑定预设联赛", ...Object.fromEntries(state.catalog.leagues.map(l => [l.id, l.name])) }, watch.league_id || "");
+  const leagueField = formField("所属 / 绑定联赛（可选）", league, "绑定预设联赛后，联赛关注也会包含成员球队资讯。自定义联赛可留空，按名称和别名匹配。");
+  const form = el("form", { class: "modal-form" }, [
+    el("p", { class: "field-caption", text: "名称、别名或证券代码命中任意一个即可；设置上下文后，还需同时命中全部上下文关键词。任意排除词命中都会排除该资讯。" }),
+    el("div", { class: "form-row" }, [formField("对象类型", type), formField("名称", input("name", watch.name || "", { required: true, maxlength: 120, placeholder: "如：任天堂、金州勇士" }))]),
+    leagueField,
+    formField("别名", el("textarea", { name: "aliases", rows: 2, maxlength: 2000, placeholder: "如：Nintendo，任天堂株式会社", text: (watch.aliases || []).join("\n") }), "用逗号、分号或换行分隔；含逗号的名称请使用简短别名。"),
+    formField("上下文关键词（可选）", input("keywords", (watch.keywords || []).join("，"), { maxlength: 2000, placeholder: "如：游戏，主机" }), "用于避免同名误匹配。填写多个词时，资讯需同时包含全部关键词；用逗号、分号或换行分隔。"),
+    formField("排除关键词（可选）", input("exclude_keywords", (watch.exclude_keywords || []).join("，"), { maxlength: 2000, placeholder: "命中任意排除词的资讯将被排除" })),
+    el("div", { class: "form-row" }, [formField("市场（可选）", input("market", watch.market || "", { maxlength: 30, placeholder: "如：NASDAQ、港股" })), formField("证券代码（可选）", input("ticker", watch.ticker || "", { maxlength: 30, placeholder: "如：AAPL、0700" }))]),
+    check("enabled", "启用此关注对象", watch.enabled !== false), formFooter(watch.id ? "保存修改" : "添加关注")
+  ]);
+  function toggleLeague() { const available = ["league", "team"].includes(type.value); leagueField.hidden = !available; league.disabled = !available; }
+  type.addEventListener("change", toggleLeague); toggleLeague();
   form.addEventListener("submit", async event => {
     event.preventDefault(); const data = new FormData(form); const submit = $("[type=submit]", form); submit.disabled = true;
-    const body = { type: data.get("type"), name: data.get("name").trim(), aliases: listValues(data.get("aliases")), keywords: listValues(data.get("keywords")), exclude_keywords: listValues(data.get("exclude_keywords")), market: data.get("market").trim(), ticker: data.get("ticker").trim(), enabled: data.has("enabled") };
+    const body = { type: data.get("type"), name: data.get("name").trim(), aliases: listValues(data.get("aliases")), keywords: listValues(data.get("keywords")), exclude_keywords: listValues(data.get("exclude_keywords")), market: data.get("market").trim(), ticker: data.get("ticker").trim(), league_id: data.get("league_id") || "", enabled: data.has("enabled") };
     if (!body.name) { modalError(form, new Error("请输入关注对象名称。")); submit.disabled = false; return; }
-    try { await api(watch.id ? `/watches/${watch.id}` : "/watches", { method: watch.id ? "PUT" : "POST", body }); closeModal(); toast(watch.id ? "关注已更新，已有资讯已重新匹配" : "已添加关注，并匹配已有资讯"); await refreshData(); renderView(); }
-    catch (error) { if (error.status !== 401) modalError(form, error); } finally { submit.disabled = false; }
+    try {
+      const saved = await api(watch.id ? `/watches/${watch.id}` : "/watches", { method: watch.id ? "PUT" : "POST", body });
+      closeModal(); toast(watch.id ? "关注已更新，已有资讯已重新匹配" : "已添加关注，并匹配已有资讯"); await refreshData();
+      if (onSaved) onSaved(saved); else renderView();
+    } catch (error) { if (error.status !== 401) modalError(form, error); } finally { submit.disabled = false; }
   }); openModal(watch.id ? "编辑关注" : "添加关注", form);
 }
-
 async function renderSchedules(id) {
   main.replaceChildren(heading("收取计划", `按你的时间收取资讯 · ${state.settings.timezone}`, [button("添加计划", () => scheduleForm(), "button button-primary", "plus")]), el("p", { class: "fetch-note", text: "每个计划对应一个时间点。可设置不同的星期和栏目，保存后立即生效。" }), loading("正在载入收取计划…"));
   try {
-    const data = await api("/schedules"); if (id !== state.renderId) return; state.schedules = data.items || [];
+    const [data, preferences] = await Promise.all([api("/schedules"), api("/preferences")]); if (id !== state.renderId) return; state.schedules = data.items || []; state.settings = preferences;
+    $(".view-heading p", main).textContent = `按你的时间收取资讯 · ${state.settings.timezone}`;
     main.lastElementChild.replaceWith(state.schedules.length ? el("div", { class: "manage-list" }, state.schedules.map(scheduleRow)) : empty("让资讯按时到来", "还没有收取计划。选择适合自己的时间与栏目，服务器会在指定时间收取公开来源。", [button("添加计划", () => scheduleForm(), "button button-primary", "plus")], "calendar"));
   } catch (error) { if (id === state.renderId && error.status !== 401) main.lastElementChild.replaceWith(errorPanel(error, renderView)); }
 }
@@ -309,73 +410,22 @@ function scheduleForm(schedule = {}) {
   }); openModal(schedule.id ? "编辑收取计划" : "添加收取计划", form);
 }
 
-function section(title, copy, content, action) {
-  return el("section", { class: "settings-section" }, [el("div", { class: "section-heading" }, [el("div", {}, [el("h2", { text: title }), copy && el("p", { text: copy })]), action]), content]);
+function renderSettings() {
+  const account = el("section", { class: "settings-section reader-settings" }, [
+    el("div", { class: "section-heading" }, el("h2", { text: "我的阅读室" })),
+    el("div", { class: "account-row" }, [el("div", {}, [el("strong", { text: state.session.username || "我的账号" }), el("p", { text: "关注对象与收藏会保存在你的阅读室中。" })]), button("退出登录", logout, "button", "logout")])
+  ]);
+  const preferences = el("section", { class: "settings-section reader-settings" }, [
+    el("div", { class: "section-heading" }, el("h2", { text: "阅读与收取" })),
+    el("dl", { class: "reading-preferences" }, [el("dt", { text: "收取时区" }), el("dd", { text: state.settings.timezone }), el("dt", { text: "资讯排序" }), el("dd", { text: "按来源发布时间，由新到旧" }), el("dt", { text: "公司焦点" }), el("dd", { text: "在当前浏览器记住你的公司、联赛与球队选择" })]),
+    el("p", { class: "field-caption", text: "打开资讯会标为已读；收藏可用于稍后阅读。摘要来自公开来源，完整报道请前往原文。" })
+  ]);
+  main.replaceChildren(heading("设置", "让阅读更适合你的节奏。"), account, preferences);
 }
-async function renderSettings(id) {
-  main.replaceChildren(heading("设置与来源", "管理资讯来源、收取偏好与阅读室。"), loading("正在载入设置…"));
-  try {
-    const [settings, sources, runs] = await Promise.all([api("/settings"), api("/sources"), api("/runs?limit=20")]); if (id !== state.renderId) return;
-    state.settings = settings; state.sources = sources.items || [];
-    main.replaceChildren(heading("设置与来源", "管理资讯来源、收取偏好与阅读室。"), section("收取状态", "手动收取与定时计划使用相同的资讯来源。", el("div", { id: "settings-status" }, statusBox())), section("资讯来源", "仅支持公开 RSS 与 Steam 官方资讯。", state.sources.length ? el("div", { class: "manage-list sources-list" }, state.sources.map(sourceRow)) : el("p", { class: "inline-empty", text: "还没有资讯来源。添加 RSS 地址或 Steam 游戏编号后，即可收取。" }), button("添加来源", () => sourceForm(), "button button-small", "plus")), section("收取偏好", "时区影响所有计划，补收会合并遗漏的任务。", settingsForm()), section("最近收取记录", "查看每次收取的结果与来源错误。", el("div", { id: "run-history" }, runTable(runs.items || [])), button("刷新", refreshRuns, "button button-small", "refresh")), section("账号与配置", null, el("div", { class: "account-row" }, [el("div", {}, [el("strong", { text: state.session.username || "管理员" }), el("p", { text: "导出文件包含关注、来源、计划与偏好设置。" })]), el("div", { class: "account-actions" }, [button("导出配置", exportConfig, "button", "download"), button("退出登录", logout, "button", "logout")])])));
-    renderSidebar();
-  } catch (error) { if (id === state.renderId && error.status !== 401) main.lastElementChild.replaceWith(errorPanel(error, renderView)); }
+async function logout() {
+  try { await api("/logout", { method: "POST", body: {} }); state.session = await api("/session"); state.renderId += 1; closeModal(); $("#auth-password").value = ""; showAuth(); toast("已退出登录"); }
+  catch (error) { showError(error); }
 }
-function statusBox() {
-  const status = state.status;
-  const box = el("div", { class: "status-box" }, [statusLine("refresh", "当前状态", status.fetching ? "正在收取资讯…" : "等待下次收取"), statusLine("clock", "最近成功", status.last_success_at ? dateTime(status.last_success_at) : "尚未成功收取"), statusLine("calendar", "下次计划", status.next_run_at ? dateTime(status.next_run_at) : "未启用收取计划")]);
-  if (status.last_error) box.append(el("p", { class: "source-error field-help", text: status.last_error }));
-  box.append(button(status.fetching ? "正在收取…" : "立即收取全部栏目", () => requestFetch(), "button", "refresh", { disabled: Boolean(status.fetching), "data-fetch-button": true })); return box;
-}
-function sourceRow(source) {
-  return el("article", { class: "manage-row" }, [el("div", { class: "manage-copy" }, [el("h3", { class: source.enabled ? "" : "disabled-text" }, [source.name, el("span", { class: "manage-type", text: `${CATEGORIES[source.category] || "资讯"} · ${source.kind === "steam" ? "Steam" : "RSS"}` })]), el("p", { class: "source-url", text: source.kind === "steam" ? `Steam App ID：${source.steam_appid || "未设置"}` : source.url }), el("p", { text: source.last_success_at ? `最近成功：${dateTime(source.last_success_at)}` : "尚未收取" }), source.last_error && el("p", { class: "source-error", text: source.last_error }), !source.enabled && el("span", { class: "enabled-label off", text: "已停用" })]), el("div", { class: "row-actions" }, [button("", () => sourceForm(source), "icon-button", "edit", { "aria-label": `编辑来源 ${source.name}` }), button("", () => confirmDelete("删除资讯来源", `删除「${source.name}」后将不再从该来源收取资讯，已收取的资讯会保留。`, () => api(`/sources/${source.id}`, { method: "DELETE" })), "icon-button", "trash", { "aria-label": `删除来源 ${source.name}` })])]);
-}
-function sourceForm(source = {}) {
-  const kind = select("kind", { rss: "公开 RSS / Atom", steam: "Steam 官方游戏资讯" }, source.kind || "rss");
-  const url = input("url", source.url || "", { type: "url", maxlength: 2000, placeholder: "https://example.com/feed.xml" });
-  const appid = input("steam_appid", source.steam_appid || "", { type: "number", min: 1, max: 2147483647, step: 1, placeholder: "如：570" });
-  const urlField = formField("订阅地址", url, "填写可公开访问的 RSS 或 Atom 地址。");
-  const steamField = formField("Steam 游戏 App ID", appid, "可在商店地址 store.steampowered.com/app/数字 中找到。");
-  const form = el("form", { class: "modal-form" }, [formField("来源名称", input("name", source.name || "", { required: true, maxlength: 120, placeholder: "为这个来源起个名称" })), el("div", { class: "form-row" }, [formField("来源类型", kind), formField("所属栏目", select("category", CATEGORIES, source.category || "games"))]), urlField, steamField, check("enabled", "启用此来源", source.enabled !== false), formFooter(source.id ? "保存修改" : "添加来源")]);
-  function toggle() { const steam = kind.value === "steam"; urlField.hidden = steam; url.disabled = steam; url.required = !steam; steamField.hidden = !steam; appid.disabled = !steam; appid.required = steam; }
-  kind.addEventListener("change", toggle); toggle();
-  form.addEventListener("submit", async event => {
-    event.preventDefault(); const data = new FormData(form); const submit = $("[type=submit]", form); const steam = data.get("kind") === "steam";
-    const body = { name: data.get("name").trim(), kind: data.get("kind"), category: data.get("category"), enabled: data.has("enabled"), url: steam ? `https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${Number(data.get("steam_appid"))}&count=20&maxlength=0` : data.get("url").trim() };
-    if (steam) body.steam_appid = Number(data.get("steam_appid"));
-    if (!body.name || !safeUrl(body.url)) { modalError(form, new Error("请填写来源名称和有效的公开 HTTP / HTTPS 地址。")); return; }
-    submit.disabled = true;
-    try { await api(source.id ? `/sources/${source.id}` : "/sources", { method: source.id ? "PUT" : "POST", body }); closeModal(); toast("资讯来源已保存，可以立即收取"); await refreshData(); renderView(); }
-    catch (error) { if (error.status !== 401) modalError(form, error); } finally { submit.disabled = false; }
-  }); openModal(source.id ? "编辑资讯来源" : "添加资讯来源", form);
-}
-function settingsForm() {
-  const timezone = input("timezone", state.settings.timezone, { required: true, list: "timezones", maxlength: 80, placeholder: "Asia/Shanghai" });
-  const datalist = el("datalist", { id: "timezones" }, ["Asia/Shanghai", "Asia/Hong_Kong", "Asia/Tokyo", "Asia/Singapore", "Europe/London", "America/New_York", "America/Los_Angeles", "UTC"].map(value => el("option", { value })));
-  const catchup = check("catch_up", "服务恢复后补收遗漏的计划", state.settings.catch_up);
-  const hours = input("catch_up_hours", state.settings.catch_up_hours, { type: "number", min: 1, max: 72, step: 1, required: true });
-  const form = el("form", { class: "settings-form" }, [formField("计划时区", timezone, "填写 IANA 时区名称，如 Asia/Shanghai。"), datalist, catchup, formField("补收时间范围（小时）", hours, "只补收此范围内的遗漏任务，多个遗漏时段合并为一次。"), el("button", { type: "submit", class: "button button-primary", text: "保存偏好" })]);
-  $("input", catchup).addEventListener("change", event => { hours.disabled = !event.target.checked; }); hours.disabled = !state.settings.catch_up;
-  form.addEventListener("submit", async event => {
-    event.preventDefault(); const data = new FormData(form); const submit = $("[type=submit]", form); const zone = data.get("timezone").trim();
-    try { new Intl.DateTimeFormat("zh-CN", { timeZone: zone }); } catch { toast("请输入有效的时区名称，如 Asia/Shanghai。"); return; }
-    submit.disabled = true;
-    try { state.settings = await api("/settings", { method: "PUT", body: { timezone: zone, catch_up: data.has("catch_up"), catch_up_hours: Number(data.get("catch_up_hours") || state.settings.catch_up_hours) } }); toast("收取偏好已保存"); await refreshData(); renderSidebar(); }
-    catch (error) { showError(error); } finally { submit.disabled = false; }
-  }); return form;
-}
-function runTable(runs) {
-  if (!runs.length) return el("p", { class: "inline-empty", text: "尚无收取记录。添加来源后手动收取，或等待已启用的计划。" });
-  const statusNames = { running: "进行中", success: "成功", completed: "成功", failed: "失败", partial: "部分成功", error: "失败" };
-  const triggers = { manual: "手动收取", schedule: "定时计划", scheduled: "定时计划", catch_up: "遗漏补收", catchup: "遗漏补收" };
-  return el("table", { class: "run-table" }, [el("caption", { class: "skip-link", text: "最近收取记录" }), el("thead", {}, el("tr", {}, [el("th", { scope: "col", text: "时间 / 触发" }), el("th", { scope: "col", text: "结果" }), el("th", { scope: "col", text: "新增" })])), el("tbody", {}, runs.map(run => el("tr", {}, [el("td", {}, [el("time", { datetime: run.started_at, text: dateTime(run.started_at) }), el("div", { class: "muted", text: triggers[run.trigger] || run.trigger || "收取" })]), el("td", {}, [el("span", { class: `run-status ${["success", "completed"].includes(run.status) ? "success" : ["failed", "error"].includes(run.status) ? "failed" : run.status === "partial" ? "partial" : ""}`, text: statusNames[run.status] || run.status }), run.error && el("div", { class: "run-error", text: run.error }), run.source_count !== undefined && el("div", { class: "muted", text: `${run.source_count} 个来源` })]), el("td", { text: run.new_count == null ? "—" : `${run.new_count} 条` })])))]);
-}
-async function refreshRuns() { const target = $("#run-history"); if (!target) return; try { const data = await api("/runs?limit=20"); if (target.isConnected) target.replaceChildren(runTable(data.items || [])); } catch (error) { showError(error); } }
-async function exportConfig() {
-  try { const data = await api("/export"); const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" })); const link = el("a", { href: url, download: `xunlan-config-${new Date().toISOString().slice(0, 10)}.json` }); document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); toast("配置已导出"); } catch (error) { showError(error); }
-}
-async function logout() { try { await api("/logout", { method: "POST", body: {} }); state.session = await api("/session"); state.renderId += 1; closeModal(); $("#auth-password").value = ""; showAuth(); toast("已退出登录"); } catch (error) { showError(error); } }
-
 function statusLine(iconName, name, value) { return el("p", { class: "status-line" }, [icon(iconName), el("span", {}, [`${name} · `, el("strong", { text: value })])]); }
 function renderSidebar() {
   const status = state.status;
@@ -406,12 +456,10 @@ async function pollStatus() {
   state.pollBusy = true;
   try {
     const wasFetching = Boolean(state.status.fetching); state.status = await api("/status"); renderSidebar(); updateFetchButtons();
-    const box = $("#settings-status"); if (box) box.replaceChildren(statusBox());
     if (wasFetching && !state.status.fetching) {
-      toast(state.status.last_error ? "收取已结束，部分来源有错误，请查看记录" : "收取已完成");
+      toast("收取已完成");
       if (["news", "following"].includes(state.view) && !state.manageWatches) renderView();
-      if (state.view === "settings") renderView();
-    } else if (state.view === "settings" && state.status.fetching) refreshRuns();
+    }
   } catch (error) { if (error.status === 401) showAuth(); } finally { state.pollBusy = false; }
 }
 

@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import socket
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -12,9 +13,10 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi.testclient import TestClient
 
-from app.collector import Collector, canonical_url, fetch_public, matches_watch, parse_rss, parse_steam, resolve_public_url
+from app.catalog import article_topics, load_catalog
+from app.collector import Collector, canonical_url, fetch_public, matches_watch, parse_rss, parse_steam, rematch_watch, resolve_public_url
 from app.db import Database
-from app.main import create_app
+from app.main import ADMIN_COOKIE_NAME, COOKIE_NAME, create_app, password_hash, token_hash
 from app.models import Source, public_url_syntax
 from app.scheduler import due_slots, next_run, slots_between
 
@@ -52,6 +54,17 @@ def add_schedule(db, time="09:00", days=None):
 
 
 class ParsingTests(unittest.TestCase):
+    def test_missing_catalog_fails_clearly(self):
+        with patch("app.catalog.Path.read_text", side_effect=FileNotFoundError("interest_catalog.json")):
+            with self.assertRaises(FileNotFoundError):
+                load_catalog()
+
+    def test_catalog_topics_are_sports_only_with_english_boundaries(self):
+        catalog = load_catalog()
+        self.assertEqual(article_topics({"title": "Golden State Warriors win", "summary": "", "category": "sports"}, catalog),
+                         {"team:golden-state-warriors", "league:nba"})
+        self.assertEqual(article_topics({"title": "Golden State Warriors movie", "summary": "", "category": "games"}, catalog), set())
+        self.assertEqual(article_topics({"title": "NBA2K update and EPLANE", "summary": "", "category": "sports"}, catalog), set())
     def test_rss_strips_html_and_preserves_dates(self):
         items = parse_rss(RSS, "https://example.com/feed")
         self.assertEqual(len(items), 2)
@@ -282,6 +295,11 @@ class APITests(unittest.TestCase):
         self.client.__exit__(None, None, None)
         self.temp.cleanup()
 
+    def become_admin(self):
+        result = self.client.post("/api/admin/login", json={"username": "reader", "password": "test-password-123"}, headers=self.headers)
+        self.assertEqual(result.status_code, 200)
+        return result
+
     def test_csrf_origin_and_cookie_security(self):
         self.assertIn("HttpOnly", self.client.post("/api/login", json={"username": "reader", "password": "test-password-123"}).headers["set-cookie"])
         self.assertEqual(self.client.post("/api/logout", json={}).status_code, 403)
@@ -291,6 +309,7 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/articles").status_code, 401)
 
     def test_watch_rematch_article_filters_and_delete_integrity(self):
+        self.become_admin()
         source = self.client.get("/api/sources").json()["items"][0]
         self.app.state.collector.persist_articles(source, parse_rss(RSS, "https://example.com/feed"))
         watch = {"type": "studio", "name": "Nintendo", "aliases": [], "keywords": [], "exclude_keywords": [], "enabled": True, "market": "", "ticker": ""}
@@ -313,6 +332,7 @@ class APITests(unittest.TestCase):
             self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_schedule_settings_persistence_and_secret_free_export(self):
+        self.become_admin()
         self.assertEqual(self.client.get("/api/schedules").json(), {"items": []})
         schedule = {"name": "Morning", "time": "08:30", "days": [0, 1, 2, 3, 4], "categories": ["games", "stocks"], "enabled": True}
         result = self.client.post("/api/schedules", json=schedule, headers=self.headers)
@@ -328,6 +348,7 @@ class APITests(unittest.TestCase):
         self.assertNotIn("csrf", json.dumps(exported))
 
     def test_source_validation_and_steam_official_endpoint(self):
+        self.become_admin()
         body = {"name": "Private", "kind": "rss", "url": "http://127.0.0.1/", "category": "games", "enabled": True}
         self.assertEqual(self.client.post("/api/sources", json=body, headers=self.headers).status_code, 422)
         body.update({"name": "Steam", "kind": "steam", "steam_appid": 570, "url": "https://attacker.example/"})
@@ -337,6 +358,7 @@ class APITests(unittest.TestCase):
         self.assertTrue(result.json()["url"].startswith("https://api.steampowered.com/"))
 
     def test_no_initial_articles_and_input_limits(self):
+        self.become_admin()
         self.assertEqual(self.client.get("/api/articles").json()["items"], [])
         self.assertEqual(self.client.get("/api/watches").json()["items"], [])
         self.assertEqual(self.client.get("/api/articles?page_size=101").status_code, 422)
@@ -354,6 +376,229 @@ class APITests(unittest.TestCase):
                 self.assertEqual(client.post("/api/setup", json=credentials).status_code, 403)
                 credentials["setup_token"] = "only-this-token"
                 self.assertEqual(client.post("/api/setup", json=credentials).status_code, 200)
+
+    def test_all_admin_apis_deny_readers_and_unauthenticated_clients(self):
+        routes = [("GET", "/api/sources", None), ("POST", "/api/sources", {"name": "Feed", "url": "https://example.com/", "category": "games"}),
+                  ("PUT", "/api/sources/1", {"name": "Feed", "url": "https://example.com/", "category": "games"}),
+                  ("DELETE", "/api/sources/1", None), ("GET", "/api/settings", None), ("PUT", "/api/settings", {"timezone": "UTC"}),
+                  ("GET", "/api/runs", None), ("GET", "/api/export", None)]
+        anonymous = TestClient(self.app)
+        for method, path, body in routes:
+            with self.subTest(method=method, path=path):
+                self.assertEqual(self.client.request(method, path, json=body, headers=self.headers).status_code, 403)
+                self.assertEqual(anonymous.request(method, path, json=body).status_code, 401)
+        self.assertEqual(self.client.get("/api/admin/session").json(), {"authenticated": False, "expires_at": None})
+        self.assertEqual(self.client.get("/api/preferences").json(), {"timezone": "Asia/Shanghai"})
+        with self.db.connection(write=True) as conn:
+            conn.execute("INSERT INTO runs(trigger,started_at,status,error) VALUES('manual','2026-01-01','failed','sensitive source error')")
+        self.assertIsNone(self.client.get("/api/status").json()["last_error"])
+
+    def test_admin_requires_credentials_again_and_csrf(self):
+        credentials = {"username": "reader", "password": "test-password-123"}
+        self.assertEqual(self.client.post("/api/admin/login", json=credentials).status_code, 403)
+        self.assertEqual(self.client.post("/api/admin/login", json=credentials, headers={**self.headers, "Origin": "https://attacker.example"}).status_code, 403)
+        credentials["password"] = "incorrect-password"
+        self.assertEqual(self.client.post("/api/admin/login", json=credentials, headers=self.headers).status_code, 403)
+        self.assertTrue(self.client.get("/api/session").json()["authenticated"])
+        result = self.become_admin()
+        cookie = result.headers["set-cookie"]
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("Path=/api", cookie)
+        self.assertIn("SameSite=strict", cookie)
+        self.assertIn("Max-Age=1800", cookie)
+        self.assertTrue(self.client.get("/api/admin/session").json()["authenticated"])
+        self.assertEqual(self.client.get("/api/settings").status_code, 200)
+        self.assertEqual(self.client.put("/api/settings", json={"timezone": "UTC"}).status_code, 403)
+        self.assertEqual(self.client.post("/api/admin/logout", json={}).status_code, 403)
+        self.assertEqual(self.client.post("/api/admin/logout", json={}, headers=self.headers).status_code, 200)
+        self.assertEqual(self.client.get("/api/settings").status_code, 403)
+        self.assertTrue(self.client.get("/api/session").json()["authenticated"])
+        with self.db.connection() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM admin_grants").fetchone()[0], 0)
+
+    def test_admin_expiry_session_binding_rotation_and_reader_logout(self):
+        self.become_admin()
+        admin_token = self.client.cookies.get(ADMIN_COOKIE_NAME)
+        old_reader_token = self.client.cookies.get(COOKIE_NAME)
+        second = TestClient(self.app)
+        second.post("/api/login", json={"username": "reader", "password": "test-password-123"})
+        second.cookies.set(ADMIN_COOKIE_NAME, admin_token, domain="testserver.local", path="/api")
+        self.assertFalse(second.get("/api/admin/session").json()["authenticated"])
+        self.assertEqual(second.get("/api/sources").status_code, 403)
+        self.assertTrue(self.client.get("/api/admin/session").json()["authenticated"])
+        with self.db.connection(write=True) as conn:
+            conn.execute("UPDATE admin_grants SET expires_at='2000-01-01T00:00:00+00:00'")
+        self.assertFalse(self.client.get("/api/admin/session").json()["authenticated"])
+        self.assertEqual(self.client.get("/api/export").status_code, 403)
+        self.become_admin()
+        old_admin_token = self.client.cookies.get(ADMIN_COOKIE_NAME)
+        result = self.client.post("/api/login", json={"username": "reader", "password": "test-password-123"})
+        self.headers = {"X-CSRF-Token": result.json()["csrf_token"]}
+        self.assertFalse(self.client.get("/api/admin/session").json()["authenticated"])
+        with self.db.connection() as conn:
+            self.assertIsNone(conn.execute("SELECT 1 FROM sessions WHERE token_hash=?", (token_hash(old_reader_token),)).fetchone())
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM admin_grants").fetchone()[0], 0)
+        revoked = TestClient(self.app)
+        revoked.cookies.set(COOKIE_NAME, old_reader_token, domain="testserver.local", path="/")
+        revoked.cookies.set(ADMIN_COOKIE_NAME, old_admin_token, domain="testserver.local", path="/api")
+        self.assertEqual(revoked.get("/api/admin/session").status_code, 401)
+        self.become_admin()
+        self.client.post("/api/logout", json={}, headers=self.headers)
+        with self.db.connection() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM admin_grants").fetchone()[0], 0)
+            self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_admin_reauthentication_rate_limit(self):
+        with patch("app.main.password_valid", return_value=False):
+            for _ in range(10):
+                self.assertEqual(self.client.post("/api/admin/login", json={"username": "reader", "password": "wrong"}, headers=self.headers).status_code, 403)
+            self.assertEqual(self.client.post("/api/admin/login", json={"username": "reader", "password": "wrong"}, headers=self.headers).status_code, 429)
+
+    def test_expired_reader_session_cannot_use_unexpired_admin_grant(self):
+        self.become_admin()
+        with self.db.connection(write=True) as conn:
+            conn.execute("UPDATE sessions SET expires_at='2000-01-01T00:00:00+00:00'")
+        self.assertEqual(self.client.get("/api/admin/session").status_code, 401)
+        self.assertEqual(self.client.get("/api/sources").status_code, 401)
+        self.assertFalse(self.client.get("/api/session").json()["authenticated"])
+
+    def test_admin_cookie_secure_matches_https_reader_cookie(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"COOKIE_SECURE": "1", "SETUP_TOKEN": ""}):
+            secure_app = create_app(directory, start_scheduler=False)
+            with TestClient(secure_app, base_url="https://testserver") as client:
+                setup = client.post("/api/setup", json={"username": "reader", "password": "test-password-123"})
+                self.assertIn("Secure", setup.headers["set-cookie"])
+                admin = client.post("/api/admin/login", json={"username": "reader", "password": "test-password-123"},
+                                    headers={"X-CSRF-Token": setup.json()["csrf_token"]})
+                self.assertEqual(admin.status_code, 200)
+                self.assertIn("Secure", admin.headers["set-cookie"])
+                self.assertTrue(client.get("/api/admin/session").json()["authenticated"])
+
+    def test_company_filter_validates_enabled_company_and_composes(self):
+        source = add_source(self.db)
+        self.app.state.collector.persist_articles(source, parse_rss(RSS, "https://example.com/feed"))
+        company = {"type": "company", "name": "Nintendo", "aliases": [], "keywords": [], "exclude_keywords": [], "enabled": True}
+        company_id = self.client.post("/api/watches", json=company, headers=self.headers).json()["id"]
+        self.assertEqual(self.client.get(f"/api/articles?company_id={company_id}").json()["total"], 1)
+        self.assertEqual(self.client.get(f"/api/articles?company_id={company_id}&q=sports").json()["total"], 0)
+        self.assertEqual(self.client.get("/api/articles?company_id=99999").status_code, 404)
+        company["enabled"] = False
+        self.client.put(f"/api/watches/{company_id}", json=company, headers=self.headers)
+        self.assertEqual(self.client.get(f"/api/articles?company_id={company_id}").status_code, 422)
+        company.update({"enabled": True, "type": "studio"})
+        self.client.put(f"/api/watches/{company_id}", json=company, headers=self.headers)
+        self.assertEqual(self.client.get(f"/api/articles?company_id={company_id}").status_code, 422)
+
+    def test_catalog_sports_filters_and_custom_teams(self):
+        catalog = self.client.get("/api/catalog").json()
+        self.assertEqual({entry["id"] for entry in catalog["leagues"]}, {"nba", "premier-league", "la-liga"})
+        source = add_source(self.db, category="sports")
+        fixtures = [("Golden State Warriors win", "warriors"), ("NBA draft update", "nba"),
+                    ("EPL title race", "epl"), ("Real Madrid wins", "real"), ("巴萨训练新闻", "barca"),
+                    ("Harbour Falcons new lineup", "custom")]
+        items = [{"title": title, "summary": "sport context", "canonical_url": f"https://example.com/{key}", "url": f"https://example.com/{key}", "published_at": None, "image_url": None} for title, key in fixtures]
+        self.app.state.collector.persist_articles(source, items)
+        game_source = add_source(self.db, "Games", "games")
+        self.app.state.collector.persist_articles(game_source, [{**items[0], "canonical_url": "https://example.com/movie", "url": "https://example.com/movie"}])
+        self.assertEqual(self.client.get("/api/articles?league_id=nba").json()["total"], 2)
+        self.assertEqual(self.client.get("/api/articles?league_id=nba&team_id=golden-state-warriors").json()["total"], 1)
+        self.assertEqual(self.client.get("/api/articles?team_id=real-madrid").json()["total"], 1)
+        self.assertEqual(self.client.get("/api/articles?league_id=la-liga").json()["total"], 2)
+        self.assertEqual(self.client.get("/api/articles?league_id=premier-league&team_id=real-madrid").status_code, 422)
+        self.assertEqual(self.client.get("/api/articles?team_id=unknown").status_code, 422)
+        self.assertEqual(self.client.get("/api/articles?league_id=unknown").status_code, 422)
+        custom = {"type": "team", "name": "Harbour Falcons", "league_id": "nba"}
+        watch_id = self.client.post("/api/watches", json=custom, headers=self.headers).json()["id"]
+        self.assertEqual(self.client.get("/api/articles?league_id=nba").json()["total"], 3)
+        self.assertEqual(self.client.get(f"/api/articles?watch_id={watch_id}").json()["total"], 1)
+        custom["enabled"] = False
+        self.client.put(f"/api/watches/{watch_id}", json=custom, headers=self.headers)
+        self.assertEqual(self.client.get("/api/articles?league_id=nba").json()["total"], 2)
+        for kind in ("company", "studio", "politician"):
+            self.assertEqual(self.client.post("/api/watches", json={"type": kind, "name": "Invalid", "league_id": "nba"}, headers=self.headers).status_code, 422)
+        self.assertEqual(self.client.post("/api/watches", json={"type": "team", "name": "Invalid", "league_id": "wrong"}, headers=self.headers).status_code, 422)
+
+    def test_preset_league_follow_rematch_and_collection_share_matcher(self):
+        source = add_source(self.db, category="sports")
+        fixtures = [{"title": "Golden State Warriors win", "summary": "playoffs", "canonical_url": "https://example.com/pre", "url": "https://example.com/pre", "published_at": None, "image_url": None}]
+        self.app.state.collector.persist_articles(source, fixtures)
+        watch = {"type": "league", "name": "NBA", "league_id": "nba", "keywords": ["playoffs"], "exclude_keywords": ["rumor"]}
+        response = self.client.post("/api/watches", json=watch, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        watch_id = response.json()["id"]
+        self.assertEqual(self.client.get(f"/api/articles?watch_id={watch_id}").json()["total"], 1)
+        new = [{**fixtures[0], "url": "https://example.com/new", "canonical_url": "https://example.com/new"},
+               {**fixtures[0], "summary": "playoffs rumor", "url": "https://example.com/rumor", "canonical_url": "https://example.com/rumor"},
+               {**fixtures[0], "summary": "regular season", "url": "https://example.com/context", "canonical_url": "https://example.com/context"}]
+        self.app.state.collector.persist_articles(source, new)
+        game_source = add_source(self.db, "Games", "games")
+        self.app.state.collector.persist_articles(game_source, [{**fixtures[0], "url": "https://example.com/game", "canonical_url": "https://example.com/game"}])
+        self.assertEqual(self.client.get(f"/api/articles?watch_id={watch_id}").json()["total"], 2)
+        self.client.put(f"/api/watches/{watch_id}", json=watch, headers=self.headers)
+        self.assertEqual(self.client.get(f"/api/articles?watch_id={watch_id}").json()["total"], 2)
+        watch["enabled"] = False
+        self.client.put(f"/api/watches/{watch_id}", json=watch, headers=self.headers)
+        self.assertEqual(self.client.get(f"/api/articles?watch_id={watch_id}").json()["total"], 0)
+        custom = self.client.post("/api/watches", json={"type": "league", "name": "playoffs"}, headers=self.headers)
+        self.assertEqual(custom.status_code, 200)
+        self.assertEqual(self.client.get(f"/api/articles?watch_id={custom.json()['id']}").json()["total"], 4)
+
+
+class MigrationTests(unittest.TestCase):
+    def test_old_database_preserves_user_article_watch_schedule_and_reindexes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "newsroom.sqlite3"
+            conn = sqlite3.connect(path)
+            conn.executescript('''
+                CREATE TABLE users(id INTEGER PRIMARY KEY,username TEXT NOT NULL,password_hash TEXT NOT NULL,created_at TEXT NOT NULL);
+                CREATE TABLE watches(id INTEGER PRIMARY KEY,type TEXT NOT NULL,name TEXT NOT NULL,aliases TEXT NOT NULL,keywords TEXT NOT NULL,exclude_keywords TEXT NOT NULL,enabled INTEGER NOT NULL,market TEXT NOT NULL,ticker TEXT NOT NULL);
+                CREATE TABLE articles(id INTEGER PRIMARY KEY,canonical_url TEXT NOT NULL UNIQUE,title TEXT NOT NULL,url TEXT NOT NULL,summary TEXT NOT NULL,source_id INTEGER,source_name TEXT NOT NULL,category TEXT NOT NULL,published_at TEXT,fetched_at TEXT NOT NULL,image_url TEXT,saved INTEGER NOT NULL DEFAULT 0,read INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE schedules(id INTEGER PRIMARY KEY,name TEXT NOT NULL,time TEXT NOT NULL,days TEXT NOT NULL,categories TEXT NOT NULL,enabled INTEGER NOT NULL,last_run_at TEXT,created_at TEXT NOT NULL);
+                CREATE TABLE settings(id INTEGER PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                INSERT INTO metadata VALUES('sources_seeded','1');
+                INSERT INTO watches VALUES(7,'company','Apple','[]','[]','[]',1,'NASDAQ','AAPL');
+                INSERT INTO articles(id,canonical_url,title,url,summary,source_name,category,fetched_at,saved,read) VALUES(11,'https://example.com/old','Golden State Warriors win','https://example.com/old','','Old feed','sports','2026-10-01T00:00:00+00:00',1,1);
+                INSERT INTO schedules VALUES(4,'Old morning','08:30','[0,1,2,3,4]','["sports"]',1,'2026-10-01T00:30:00+00:00','2026-09-01T00:00:00+00:00');
+                INSERT INTO settings VALUES(1,'{"timezone":"UTC","catch_up":false,"catch_up_hours":2}');
+            ''')
+            conn.execute("INSERT INTO users VALUES(1,'reader',?,'2026-09-01T00:00:00+00:00')", (password_hash("existing-password"),))
+            conn.commit()
+            conn.close()
+            app = create_app(directory, start_scheduler=False)
+            with TestClient(app) as client:
+                login = client.post("/api/login", json={"username": "reader", "password": "existing-password"})
+                self.assertEqual(login.status_code, 200)
+                watch = client.get("/api/watches").json()["items"][0]
+                self.assertEqual((watch["id"], watch["ticker"], watch["league_id"]), (7, "AAPL", ""))
+                article = client.get("/api/articles?league_id=nba").json()["items"][0]
+                self.assertEqual((article["id"], article["saved"], article["read"]), (11, True, True))
+                self.assertEqual(client.get("/api/preferences").json(), {"timezone": "UTC"})
+                self.assertEqual(client.get("/api/schedules").json()["items"][0]["id"], 4)
+                self.assertEqual(client.get("/api/sources").status_code, 403)
+            app.state.db.initialize()
+            with app.state.db.connection() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM article_topics").fetchone()[0], 2)
+                self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_catalog_change_reindexes_historical_articles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = empty_db(directory)
+            source = add_source(db, category="sports")
+            collector = Collector(db)
+            item = {"title": "New Club wins", "summary": "", "canonical_url": "https://example.com/newclub", "url": "https://example.com/newclub", "published_at": None, "image_url": None}
+            collector.persist_articles(source, [item])
+            with db.connection(write=True) as conn:
+                watch_id = conn.execute("INSERT INTO watches(type,name,aliases,keywords,exclude_keywords,enabled,market,ticker,league_id) VALUES('league','NBA','[]','[]','[]',1,'','','nba')").lastrowid
+                rematch_watch(conn, watch_id, db.catalog)
+            with db.connection() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM article_topics").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM article_watches").fetchone()[0], 0)
+            db.catalog["teams"].append({"id": "new-club", "name": "New Club", "aliases": [], "league_id": "nba"})
+            db.initialize()
+            with db.connection() as conn:
+                self.assertEqual({row[0] for row in conn.execute("SELECT topic_id FROM article_topics")}, {"team:new-club", "league:nba"})
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM article_watches WHERE watch_id=?", (watch_id,)).fetchone()[0], 1)
 
 
 if __name__ == "__main__":
