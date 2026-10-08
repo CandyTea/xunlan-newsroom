@@ -1,0 +1,25 @@
+services:
+  app:
+    environment:
+      COOKIE_SECURE: "1"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      NEWSROOM_DOMAIN: "${NEWSROOM_DOMAIN:?set NEWSROOM_DOMAIN in .env}"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  caddy_data:
+    name: newsroom-caddy-data
+  caddy_config:
+    name: newsroom-caddy-config

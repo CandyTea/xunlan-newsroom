@@ -1,0 +1,24 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: newsroom:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NEWSROOM_DATA_DIR: /data
+      SETUP_TOKEN: "${SETUP_TOKEN:?请先在 .env 中设置随机安装令牌}"
+      TZ: Asia/Shanghai
+    ports:
+      - "${NEWSROOM_BIND:-127.0.0.1}:8088:8000"
+    volumes:
+      - newsroom_data:/data
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+
+volumes:
+  newsroom_data:
+    name: newsroom-data

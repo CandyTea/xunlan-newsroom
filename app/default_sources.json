@@ -1,0 +1,15 @@
+[
+  {"name":"游研社","kind":"rss","url":"https://www.yystv.cn/rss/feed","category":"games","enabled":true},
+  {"name":"机核","kind":"rss","url":"https://www.gcores.com/rss","category":"games","enabled":true},
+  {"name":"中新网体育","kind":"rss","url":"https://www.chinanews.com.cn/rss/sports.xml","category":"sports","enabled":true},
+  {"name":"BBC 体育","kind":"rss","url":"https://feeds.bbci.co.uk/sport/rss.xml","category":"sports","enabled":true},
+  {"name":"ESPN","kind":"rss","url":"https://www.espn.com/espn/rss/news","category":"sports","enabled":true},
+  {"name":"中新网财经","kind":"rss","url":"https://www.chinanews.com.cn/rss/finance.xml","category":"stocks","enabled":true},
+  {"name":"FT中文网","kind":"rss","url":"https://www.ftchinese.com/rss/feed","category":"stocks","enabled":true},
+  {"name":"The Guardian 财经","kind":"rss","url":"https://www.theguardian.com/business/rss","category":"stocks","enabled":true},
+  {"name":"中新网国际","kind":"rss","url":"https://www.chinanews.com.cn/rss/world.xml","category":"politics","enabled":true},
+  {"name":"BBC 国际","kind":"rss","url":"https://feeds.bbci.co.uk/news/world/rss.xml","category":"politics","enabled":true},
+  {"name":"The Guardian 国际","kind":"rss","url":"https://www.theguardian.com/world/rss","category":"politics","enabled":true},
+  {"name":"Steam 环世界","kind":"steam","url":"https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/","steam_appid":294100,"category":"games","enabled":false},
+  {"name":"Steam 只狼","kind":"steam","url":"https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/","steam_appid":814380,"category":"games","enabled":false}
+]

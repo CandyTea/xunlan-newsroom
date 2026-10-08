@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="description" content="讯览 · 你的个人资讯阅读室。关注游戏、体育、股票与政治，按计划收取公开来源资讯。">
+  <title>讯览 · 个人资讯阅读室</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到内容</a>
+  <div id="boot" class="boot" role="status"><span class="brand">讯览<span class="brand-dot">·</span></span><p>正在打开阅读室…</p></div>
+  <section id="auth" class="auth-page" hidden>
+    <div class="auth-heading"><span class="brand">讯览<span class="brand-dot">·</span></span><p>个人资讯阅读室</p></div>
+    <div class="auth-box">
+      <p class="section-label">NEWSROOM</p>
+      <h1 id="auth-title">欢迎回来</h1>
+      <p id="auth-description" class="muted">登录，继续阅读你关注的资讯。</p>
+      <form id="auth-form">
+        <label>用户名<input id="auth-username" name="username" required autocomplete="username" maxlength="50" placeholder="你的用户名"></label>
+        <label>密码<input id="auth-password" name="password" type="password" required maxlength="256" autocomplete="current-password" placeholder="输入密码"></label>
+        <label id="setup-token-field" hidden>安装令牌<input id="auth-setup-token" name="setup_token" type="password" maxlength="256" autocomplete="off" placeholder="服务器配置的 SETUP_TOKEN"><small>填写部署时设置的安装令牌。</small></label>
+        <p id="auth-error" class="form-error" role="alert" hidden></p>
+        <button id="auth-submit" class="button button-primary" type="submit">登录</button>
+      </form>
+      <p class="auth-note">公开来源 · 专属关注 · 定时收取</p>
+    </div>
+    <p class="auth-footer">把注意力留给值得阅读的事。</p>
+  </section>
+  <div id="app" hidden>
+    <header class="masthead">
+      <div class="masthead-top"><p id="masthead-date" class="masthead-date"></p><a class="brand" href="#news" aria-label="讯览首页">讯览<span class="brand-dot">·</span></a><button id="header-fetch" class="button button-text" type="button"><span data-icon="refresh"></span><span>收取资讯</span></button></div>
+      <div class="masthead-sub"><span>个人资讯阅读室</span><span>游戏 / 体育 / 股票 / 政治</span></div>
+      <nav class="desktop-nav" aria-label="主导航"><a href="#news" data-view="news">新闻</a><a href="#following" data-view="following">我的关注</a><a href="#schedules" data-view="schedules">收取计划</a><a href="#settings" data-view="settings">设置与来源</a></nav>
+    </header>
+    <div class="workspace">
+      <main id="main-content" tabindex="-1"></main>
+      <aside id="sidebar" class="sidebar" aria-label="阅读室状态"></aside>
+    </div>
+    <footer class="desktop-footer"><span>讯览 · 个人资讯阅读室</span><span>摘要来自原始来源，全文请前往原文阅读。</span></footer>
+    <nav class="bottom-nav" aria-label="主导航"><a href="#news" data-view="news"><span data-icon="news"></span><span>新闻</span></a><a href="#following" data-view="following"><span data-icon="bookmark"></span><span>关注</span></a><a href="#schedules" data-view="schedules"><span data-icon="calendar"></span><span>计划</span></a><a href="#settings" data-view="settings"><span data-icon="settings"></span><span>设置</span></a></nav>
+  </div>
+  <dialog id="modal" class="modal" aria-labelledby="modal-title"><div class="modal-header"><h2 id="modal-title"></h2><button id="modal-close" class="icon-button" type="button" aria-label="关闭窗口"><span data-icon="close"></span></button></div><div id="modal-body" class="modal-body"></div></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <noscript><div class="no-script">讯览需要启用 JavaScript 才能登录和阅读资讯。</div></noscript>
+</body>
+</html>

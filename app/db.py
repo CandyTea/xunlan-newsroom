@@ -1,0 +1,107 @@
+"""Small SQLite store. Each operation owns its connection and transaction."""
+import json
+import sqlite3
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+DEFAULT_SETTINGS = {"timezone": "Asia/Shanghai", "catch_up": True, "catch_up_hours": 4}
+
+
+class Database:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+
+    @contextmanager
+    def connection(self, write=False):
+        with self.lock:
+            conn = sqlite3.connect(self.path, timeout=15)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=15000")
+            try:
+                if write:
+                    conn.execute("BEGIN IMMEDIATE")
+                yield conn
+                if write:
+                    conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def initialize(self):
+        with self.connection() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY CHECK(id=1), username TEXT NOT NULL,
+                    password_hash TEXT NOT NULL, created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+                    csrf_token TEXT NOT NULL, expires_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS settings (
+                    id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS sources (
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+                    url TEXT NOT NULL, category TEXT NOT NULL, enabled INTEGER NOT NULL,
+                    steam_appid INTEGER, last_success_at TEXT, last_error TEXT);
+                CREATE TABLE IF NOT EXISTS articles (
+                    id INTEGER PRIMARY KEY, canonical_url TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL, url TEXT NOT NULL, summary TEXT NOT NULL,
+                    source_id INTEGER REFERENCES sources(id) ON DELETE SET NULL,
+                    source_name TEXT NOT NULL, category TEXT NOT NULL,
+                    published_at TEXT, fetched_at TEXT NOT NULL, image_url TEXT,
+                    saved INTEGER NOT NULL DEFAULT 0, read INTEGER NOT NULL DEFAULT 0);
+                CREATE INDEX IF NOT EXISTS articles_date ON articles(COALESCE(published_at,fetched_at) DESC,id DESC);
+                CREATE TABLE IF NOT EXISTS watches (
+                    id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT NOT NULL,
+                    aliases TEXT NOT NULL, keywords TEXT NOT NULL, exclude_keywords TEXT NOT NULL,
+                    enabled INTEGER NOT NULL, market TEXT NOT NULL, ticker TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS article_watches (
+                    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                    watch_id INTEGER NOT NULL REFERENCES watches(id) ON DELETE CASCADE,
+                    PRIMARY KEY(article_id,watch_id));
+                CREATE INDEX IF NOT EXISTS hits_watch ON article_watches(watch_id,article_id);
+                CREATE TABLE IF NOT EXISTS schedules (
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL, time TEXT NOT NULL,
+                    days TEXT NOT NULL, categories TEXT NOT NULL, enabled INTEGER NOT NULL,
+                    last_run_at TEXT, created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS runs (
+                    id INTEGER PRIMARY KEY, trigger TEXT NOT NULL, started_at TEXT NOT NULL,
+                    finished_at TEXT, status TEXT NOT NULL, new_count INTEGER NOT NULL DEFAULT 0,
+                    source_count INTEGER NOT NULL DEFAULT 0, error TEXT);
+                CREATE TABLE IF NOT EXISTS schedule_slots (
+                    schedule_id INTEGER NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+                    scheduled_at TEXT NOT NULL, run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+                    PRIMARY KEY(schedule_id,scheduled_at));
+                CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            """)
+            conn.execute("INSERT OR IGNORE INTO settings(id,value) VALUES(1,?)", (json.dumps(DEFAULT_SETTINGS),))
+            conn.execute("UPDATE runs SET status='interrupted',finished_at=?,error=? WHERE status='running'",
+                         (utc_now(), "服务重启中断了此次采集；已保存的文章仍然保留"))
+            seeded = conn.execute("SELECT 1 FROM metadata WHERE key='sources_seeded'").fetchone()
+            if not seeded:
+                seed = Path(__file__).with_name("default_sources.json")
+                if seed.exists():
+                    from .models import Source
+                    for source in json.loads(seed.read_text(encoding="utf-8")):
+                        source = Source(**source).model_dump()
+                        conn.execute("INSERT INTO sources(name,kind,url,category,enabled,steam_appid) VALUES(?,?,?,?,?,?)",
+                                     (source["name"], source.get("kind", "rss"), source["url"], source["category"],
+                                      int(source.get("enabled", True)), source.get("steam_appid")))
+                conn.execute("INSERT INTO metadata(key,value) VALUES('sources_seeded','1')")
+            conn.commit()
+
+    def settings(self):
+        with self.connection() as conn:
+            return json.loads(conn.execute("SELECT value FROM settings WHERE id=1").fetchone()[0])
