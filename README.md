@@ -59,7 +59,15 @@ $env:COOKIE_SECURE = "0"
 
 ## OpenCloudOS 9 部署
 
-从 GitHub 下载后，在服务器上进入仓库目录。公开仓库可以使用 `git clone <仓库地址>`；私有仓库需要先配置 GitHub 访问权限。然后按下文安装 Docker、填写 `.env` 并启动应用。
+在服务器上获取源码并进入项目目录：
+
+```bash
+sudo yum install -y git
+git clone https://github.com/CandyTea/xunlan-newsroom.git
+cd xunlan-newsroom
+```
+
+然后按下文安装 Docker、填写 `.env` 并启动应用。
 
 ### 1. 准备 Docker 与 Compose v2
 
