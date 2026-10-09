@@ -1,4 +1,4 @@
-# 讯览（Newsroom）v1.4.0
+# 讯览（Newsroom）v1.5.0
 
 讯览是一款自托管的新闻阅读器，保留一个管理账号，支持独立游客阅读。它按游戏、体育、股票和国际新闻分类汇总来源，支持关注词条、收藏、已读状态与定时抓取。视觉方向以财新现有识别度为灵感。
 
@@ -11,6 +11,26 @@ v1.2.0 增加可配置新闻翻译：列表自动翻译外文标题和来源摘�
 v1.3.0 增加站内正文阅读：点击新闻标题即可打开阅读页，自动读取来源公开页面中的正文，按段落显示；手机端使用整屏阅读布局。正文翻译需手动点击「翻译正文」，原站链接作为备用入口。
 
 v1.4.0 增加默认游客模式：无需账号浏览公开资讯，游客可以自定义关注、收藏、已读、收取计划、时区和翻译供应商配置。游客之间以及游客与账号之间分别保存这些数据，管理员操作继续要求账号登录及再次验证。
+
+v1.5.0 增加 Telegram 公开频道来源，预置启用罗马诺官方频道 `@FabrizioRomanoTG`，归入体育栏目。支持添加公开频道用户名或链接，文字消息采集后即可在本站阅读和翻译。
+
+## Telegram 频道消息
+
+升级并重新构建后，应用会一次性添加「罗马诺 · Telegram」来源。新增其他频道时，登录账号后打开 `/admin`，用现有账号密码再次验证，进入「资讯来源 → 添加来源」，选择「Telegram 公开频道」，填写名称和所属栏目。
+
+频道输入支持以下形式，保存后统一使用 HTTPS 公开预览页面：
+
+- `FabrizioRomanoTG` 或 `@FabrizioRomanoTG`。
+- `https://t.me/FabrizioRomanoTG` 或 `t.me/FabrizioRomanoTG`。
+- `https://t.me/s/FabrizioRomanoTG`；也可粘贴该频道的单条公开消息链接，应用将订阅整个频道。
+
+频道选择依据罗马诺[官方主页的 Telegram 链接](https://linktr.ee/fabrizioromano)，指向 [@FabrizioRomanoTG](https://t.me/FabrizioRomanoTG)。本实现读取频道公开网页，不调用需要账户登录的 Telegram 客户端 API，无需 Telegram 账号、Premium、Bot Token 或付费 API。私密邀请链接、无公开用户名的数字频道 ID，以及禁止网页预览的频道暂不支持。
+
+定时或手动收取会尝试服务器直连；网页同时沿用静默海外补收。罗马诺预置频道纳入现有 GitHub Actions 公开缓存，计划为每小时两次，实际执行可能延迟；缓存失效时网页尝试当前设备直连、AllOrigins 和已有 Jina HTML 路线。自己新增的频道使用服务器与网页补收，不会自动把服务器上的频道配置发布到 GitHub。转接路线仅传送公开频道 URL，不发送阅读会话、Telegram 登录信息或翻译密钥。网络、跨域、服务额度与频道网页限制仍可能导致失败，不保证即时同步或完整历史。
+
+读取公开预览页中当前提供的文字消息及图片封面，以频道用户名和消息编号生成固定链接去重，保留发布时间。标题来自消息第一行，摘要来自消息原文；完整文字按段落缓存，打开即显示正文，沿用列表自动翻译和正文手动翻译、球队匹配、收藏与已读。没有文字的纯图片或视频消息暂不收取，视频、附件、评论和历史分页不导入，也不播放 Telegram 页面脚本。
+
+游客也可阅读已启用频道并后台补收，补收消息仅归当前游客，翻译使用自己的配置。来源管理仍由管理员控制，游客无法修改全站频道列表。预置公开频道页面及消息进入 GitHub 公开新闻缓存，个人频道配置、API Key、阅读状态和译文不发布。
 
 ## 游客模式
 
@@ -42,7 +62,7 @@ v1.4.0 增加默认游客模式：无需账号浏览公开资讯，游客可以�
 
 当前设备先尝试现有 AllOrigins 转接，再尝试 [Jina Reader 的 HTML 读取接口](https://github.com/jina-ai/reader#using-request-headers)；服务器同时沿用公网地址检查、DNS、代理和证书验证来访问原文，单次直连总预算 20 秒。转接仅接收原文公开 URL，不发送网站登录 Cookie、API Key、关注词条或私有配置。服务可能受跨域、网络、额度、反爬和页面结构限制，不能保证所有来源都可读取。来源标记为需订阅时不保存正文；其他页面也可能只提供部分公开段落，完整内容以原站为准。
 
-正文和正文译文保存在你自己的服务器数据库，不发布到 GitHub 公开新闻缓存。账号、收藏、关注和管理员鉴权继续沿用。更新后需要重新构建应用以安装正文提取依赖；正文读取和翻译可以通过账号或游客阅读会话使用。
+站内提取的新闻正文和正文译文保存在你自己的服务器数据库，不发布到 GitHub 公开新闻缓存；预置 Telegram 公开频道原页面属于公开消息缓存。账号、收藏、关注和管理员鉴权继续沿用。更新后需要重新构建应用以安装正文提取依赖；正文读取和翻译可以通过账号或游客阅读会话使用。
 
 ## 新闻翻译
 
@@ -65,12 +85,12 @@ API Key 仅用于服务端请求所选供应商，不在设置响应、普通导
 
 ## 已配置来源
 
-初始配置含 15 个已启用 RSS 来源和 2 个默认关闭的 Steam 新闻示例。来源覆盖会随网站 RSS 内容变化。来源的增删、停用和错误查看在 `/admin` 管理入口中进行。
+初始配置含 15 个已启用 RSS 来源、1 个已启用的 Telegram 罗马诺频道和 2 个默认关闭的 Steam 新闻示例。来源覆盖会随公开内容变化。来源的增删、停用和错误查看在 `/admin` 管理入口中进行。
 
 | 分类 | 已启用来源 |
 | --- | --- |
 | 游戏 | [游研社](https://www.yystv.cn/rss/feed)、[机核](https://www.gcores.com/rss) |
-| 体育 | [中新网体育](https://www.chinanews.com.cn/rss/sports.xml)、[BBC 体育](https://feeds.bbci.co.uk/sport/rss.xml)、[ESPN](https://www.espn.com/espn/rss/news)、[ESPN NBA](https://www.espn.com/espn/rss/nba/news)、[BBC 足球](https://feeds.bbci.co.uk/sport/football/rss.xml)、[The Guardian 英超](https://www.theguardian.com/football/premierleague/rss)、[The Guardian 皇家马德里](https://www.theguardian.com/football/realmadrid/rss) |
+| 体育 | [中新网体育](https://www.chinanews.com.cn/rss/sports.xml)、[BBC 体育](https://feeds.bbci.co.uk/sport/rss.xml)、[ESPN](https://www.espn.com/espn/rss/news)、[ESPN NBA](https://www.espn.com/espn/rss/nba/news)、[BBC 足球](https://feeds.bbci.co.uk/sport/football/rss.xml)、[The Guardian 英超](https://www.theguardian.com/football/premierleague/rss)、[The Guardian 皇家马德里](https://www.theguardian.com/football/realmadrid/rss)、[罗马诺 Telegram](https://t.me/FabrizioRomanoTG) |
 | 股票 | [中新网财经](https://www.chinanews.com.cn/rss/finance.xml)、[FT 中文网](https://www.ftchinese.com/rss/feed)、[The Guardian 财经](https://www.theguardian.com/business/rss) |
 | 政治 | [中新网国际](https://www.chinanews.com.cn/rss/world.xml)、[BBC 国际](https://feeds.bbci.co.uk/news/world/rss.xml)、[The Guardian 国际](https://www.theguardian.com/world/rss) |
 

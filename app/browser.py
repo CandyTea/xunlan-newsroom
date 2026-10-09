@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 
 from .collector import MAX_BYTES, _article, parse_rss
 from .db import load_default_sources
+from .telegram import channel_url, parse_telegram
 
 FOREIGN_HOSTS = {"feeds.bbci.co.uk", "www.espn.com", "www.theguardian.com", "www.ftchinese.com"}
 CACHE_BASE_URL = "https://raw.githubusercontent.com/CandyTea/xunlan-newsroom/news-cache/public-feeds"
@@ -20,13 +21,21 @@ def browser_cache_url(source_url):
 
 def browser_source_urls():
     return {source["url"] for _, source in load_default_sources()
-            if source["kind"] == "rss" and urlsplit(source["url"]).hostname in FOREIGN_HOSTS}
+            if source["kind"] == "telegram" or source["kind"] == "rss" and urlsplit(source["url"]).hostname in FOREIGN_HOSTS}
+
+
+def browser_source_allowed(source, preset_urls):
+    if source["kind"] == "telegram":
+        return channel_url(source["url"]) == source["url"]
+    return source["kind"] == "rss" and source["url"] in preset_urls
 
 
 def parse_browser_feed(content, format, source_url):
     data = content.encode("utf-8")
     if len(data) > MAX_BYTES:
         raise ValueError("来源响应超过 2 MB 上限")
+    if format == "telegram":
+        return parse_telegram(data, source_url)
     if format == "rss":
         return parse_rss(data, source_url)
     payload = json.loads(data)

@@ -1,4 +1,4 @@
-"""Publish only preset public overseas RSS for the web reader's cache route."""
+"""Publish preset public overseas feeds and Telegram channel previews."""
 import argparse
 import asyncio
 import json
@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 
 from .browser import browser_source_urls, cache_filename
-from .collector import MAX_BYTES, fetch_public, parse_rss, safe_error
+from .collector import MAX_BYTES, fetch_public, parse_rss, parse_source, safe_error
 from .db import load_default_sources, utc_now
 from .espn import ESPN_FALLBACKS, fallback_rss
 
@@ -36,11 +36,11 @@ async def build_cache(output):
             (output / filename).write_bytes(prior)
         async with semaphore:
             try:
-                route = "rss"
+                route = "telegram-public-preview" if source["kind"] == "telegram" else "rss"
                 route_errors = []
                 try:
                     data, base_url = await fetch_public(source["url"])
-                    articles = parse_rss(data, base_url)
+                    articles = parse_source(data, source, base_url)
                     if not articles:
                         raise ValueError("来源没有返回可保存的资讯")
                 except (OSError, ValueError, ET.ParseError, httpx.HTTPError):
@@ -49,8 +49,9 @@ async def build_cache(output):
                     data, route_errors = await fallback_rss(source)
                     articles = parse_rss(data, source["url"])
                     route = "espn-public-api"
-                content = ET.tostring(ET.fromstring(data), encoding="unicode")
-                payload = {"source_url": source["url"], "fetched_at": utc_now(), "content": content}
+                format = "telegram" if source["kind"] == "telegram" else "rss"
+                content = data.decode("utf-8", errors="replace") if format == "telegram" else ET.tostring(ET.fromstring(data), encoding="unicode")
+                payload = {"source_url": source["url"], "fetched_at": utc_now(), "format": format, "content": content}
                 encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 if len(encoded) > MAX_BYTES:
                     raise ValueError("来源响应超过缓存大小上限")

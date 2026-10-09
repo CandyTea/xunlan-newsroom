@@ -6,7 +6,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .collector import fetch_config, fetch_public, parse_rss, parse_steam, safe_error
+from .collector import fetch_config, fetch_public, parse_source, safe_error
 from .dns import dns_mode
 from .db import load_default_sources
 from .models import CATEGORIES
@@ -49,10 +49,7 @@ async def _check_sources(sources):
         async with semaphore:
             try:
                 data, final_url = await fetch_public(source["url"])
-                if source["kind"] == "steam":
-                    articles = parse_steam(data, source["steam_appid"])
-                else:
-                    articles = parse_rss(data, final_url)
+                articles = parse_source(data, source, final_url)
                 result = {"source": source, "ok": True, "count": len(articles), "error": ""}
             except Exception as exc:
                 result = {"source": source, "ok": False, "count": 0, "error": safe_error(exc)}

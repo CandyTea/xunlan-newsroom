@@ -362,6 +362,15 @@ def parse_steam(data, appid):
     return articles
 
 
+def parse_source(data, source, base_url=None):
+    if source["kind"] == "steam":
+        return parse_steam(data, source["steam_appid"])
+    if source["kind"] == "telegram":
+        from .telegram import parse_telegram
+        return parse_telegram(data, source["url"])
+    return parse_rss(data, base_url or source["url"])
+
+
 def safe_error(exc):
     if isinstance(exc, httpx.HTTPStatusError):
         return f"来源返回 HTTP {exc.response.status_code}"
@@ -441,6 +450,11 @@ class Collector:
                 if not inserted.rowcount:
                     continue
                 count += 1
+                content = article.get("content")
+                if source["kind"] == "telegram" and content:
+                    conn.execute("INSERT INTO article_content(article_id,source_url,paragraphs,author,fetched_at) VALUES(?,?,?,?,?)",
+                                 (inserted.lastrowid, article["url"], json.dumps(content["paragraphs"], ensure_ascii=False),
+                                  content["author"], utc_now()))
                 conn.executemany("INSERT INTO article_topics(article_id,topic_id) VALUES(?,?)",
                                  [(inserted.lastrowid, topic) for topic in article_topics(article, self.db.catalog)])
                 for watch in watches:
@@ -477,7 +491,7 @@ class Collector:
                 attempted += 1
                 try:
                     data, base_url = await self.fetcher(source["url"])
-                    articles = parse_steam(data, source["steam_appid"]) if source["kind"] == "steam" else parse_rss(data, base_url)
+                    articles = parse_source(data, source, base_url)
                     with self.db.connection() as conn:
                         still_exists = conn.execute("SELECT 1 FROM sources WHERE id=?", (source["id"],)).fetchone()
                     if still_exists:

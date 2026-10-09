@@ -5,6 +5,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .telegram import channel_url
+
 Category = Literal["games", "sports", "stocks", "politics"]
 CATEGORIES = ("games", "sports", "stocks", "politics")
 
@@ -91,7 +93,7 @@ class Schedule(StrictModel):
 
 class Source(StrictModel):
     name: str = Field(min_length=1, max_length=120)
-    kind: Literal["rss", "steam"] = "rss"
+    kind: Literal["rss", "steam", "telegram"] = "rss"
     url: str = Field(default="", max_length=2048)
     category: Category
     enabled: bool = True
@@ -106,6 +108,9 @@ class Source(StrictModel):
             if not self.steam_appid:
                 raise ValueError("Steam 来源需要有效的 App ID")
             self.url = f"https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid={self.steam_appid}&count=100&maxlength=1800&format=json"
+        elif self.kind == "telegram":
+            self.url = channel_url(self.url)
+            self.steam_appid = None
         else:
             self.url = public_url_syntax(self.url)
             self.steam_appid = None
@@ -145,7 +150,7 @@ class FetchRequest(StrictModel):
 class BrowserFeed(StrictModel):
     source_id: int = Field(gt=0)
     source_url: str = Field(min_length=1, max_length=2048)
-    format: Literal["rss", "rss2json"]
+    format: Literal["rss", "rss2json", "telegram"]
     content: str = Field(max_length=2 * 1024 * 1024)
 
 

@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .collector import Collector, fetch_config, fetch_public, rematch_watch, resolve_public_url, watch_from_row
-from .browser import browser_cache_url, browser_source_urls, parse_browser_feed
+from .browser import browser_cache_url, browser_source_allowed, browser_source_urls, parse_browser_feed
 from .content import ArticleReader, ContentError
 from .db import Database, utc_now
 from .guests import GuestReaders
@@ -119,7 +119,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await reader.stop()
         await guests.stop()
 
-    app = FastAPI(title="Newsroom", version="1.4.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.5.0", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -131,7 +131,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; connect-src 'self' https://raw.githubusercontent.com https://www.espn.com https://api.rss2json.com https://api.allorigins.win https://r.jina.ai; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; connect-src 'self' https://t.me https://raw.githubusercontent.com https://www.espn.com https://api.rss2json.com https://api.allorigins.win https://r.jina.ai; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         if request.url.path.startswith("/api/") or request.url.path in ("/", "/admin"):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -177,6 +177,11 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         services = guests.get(reader_id(session))
         if article is not None:
             services.db.ensure_article(article)
+            if urlsplit(article["url"]).hostname == "t.me":
+                with db.connection() as conn:
+                    content = reader.cached(conn, article)
+                if content:
+                    services.reader.store(article, content)
         return services.db, services.translator, services.reader
 
     def reader_timezone(session):
@@ -619,10 +624,11 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             return {"items": [source_from_row(row) for row in conn.execute("SELECT * FROM sources ORDER BY category,id")]}
 
     async def write_source(body, source_id=None):
-        try:
-            await resolve_public_url(body.url)
-        except (ValueError, TimeoutError, OSError) as exc:
-            raise HTTPException(422, "来源网址无法解析为允许的公网地址") from exc
+        if body.kind != "telegram":
+            try:
+                await resolve_public_url(body.url)
+            except (ValueError, TimeoutError, OSError) as exc:
+                raise HTTPException(422, "来源网址无法解析为允许的公网地址") from exc
         values = (body.name, body.kind, body.url, body.category, int(body.enabled), body.steam_appid)
         with db.connection(write=True) as conn:
             if source_id is None:
@@ -706,17 +712,20 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
     @app.get("/api/browser/sources", dependencies=[Depends(require_reader)])
     def browser_sources():
         with db.connection() as conn:
-            items = [{**{key: row[key] for key in ("id", "name", "url", "category")}, "cache_url": browser_cache_url(row["url"])}
-                     for row in conn.execute("SELECT * FROM sources WHERE enabled=1 AND kind='rss' ORDER BY id")
-                     if row["url"] in browser_urls]
+            items = [{**{key: row[key] for key in ("id", "name", "kind", "url", "category")},
+                      "cache_url": browser_cache_url(row["url"]) if row["url"] in browser_urls else None}
+                     for row in conn.execute("SELECT * FROM sources WHERE enabled=1 AND kind IN ('rss','telegram') ORDER BY id")
+                     if browser_source_allowed(row, browser_urls)]
         return {"items": items}
 
     @app.post("/api/browser/import")
     def browser_import(body: BrowserFeed, session=Depends(require_reader)):
         with db.connection() as conn:
             row = ensure_row(conn, "sources", body.source_id)
-            if not row["enabled"] or row["kind"] != "rss" or row["url"] != body.source_url or row["url"] not in browser_urls:
+            if not row["enabled"] or row["url"] != body.source_url or not browser_source_allowed(row, browser_urls):
                 raise HTTPException(409, "此来源已停用或地址改变，未保存客户端数据")
+            if (row["kind"] == "telegram") != (body.format == "telegram"):
+                raise HTTPException(422, "消息格式与来源类型不一致")
             source = dict(row)
         try:
             articles = parse_browser_feed(body.content, body.format, source["url"])
@@ -725,7 +734,8 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         with db.lock:
             with db.connection() as conn:
                 row = ensure_row(conn, "sources", body.source_id)
-                if not row["enabled"] or row["kind"] != "rss" or row["url"] != body.source_url:
+                if (not row["enabled"] or row["url"] != body.source_url or not browser_source_allowed(row, browser_urls)
+                        or (row["kind"] == "telegram") != (body.format == "telegram")):
                     raise HTTPException(409, "此来源已停用或地址改变，未保存客户端数据")
                 source = dict(row)
             new_count = collector.persist_articles(source, articles, reader_id(session) if session.get("guest") else "public")
@@ -744,8 +754,8 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         errors = []
         with db.connection(write=True) as conn:
             for failure in body.failures:
-                row = conn.execute("SELECT * FROM sources WHERE id=? AND enabled=1 AND kind='rss'", (failure.source_id,)).fetchone()
-                if row is not None and row["url"] == failure.source_url and row["url"] in browser_urls:
+                row = conn.execute("SELECT * FROM sources WHERE id=? AND enabled=1 AND kind IN ('rss','telegram')", (failure.source_id,)).fetchone()
+                if row is not None and row["url"] == failure.source_url and browser_source_allowed(row, browser_urls):
                     errors.append(f"{row['name']}: {failure.reason}")
             if errors:
                 now = utc_now()

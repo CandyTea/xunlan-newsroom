@@ -37,15 +37,36 @@ window.BrowserNews = (() => {
         if (new TextEncoder().encode(content).byteLength > MAX_BYTES) throw new Error("来源内容超过 2 MB");
       }
       if (route.format === "article") return { content };
+      let format = route.format;
+      if (route.format === "telegram-reader") {
+        const payload = JSON.parse(content);
+        if (payload.code !== 200 || typeof payload.data?.content !== "string" || payload.data.warning) throw new Error("频道读取服务未返回有效页面");
+        content = payload.data.content;
+        if (new TextEncoder().encode(content).byteLength > MAX_BYTES) throw new Error("频道页面超过 2 MB");
+        format = "telegram";
+      }
       if (route.format === "cache") {
         const data = JSON.parse(content);
         const fetchedAt = Date.parse(data.fetched_at);
         if (data.source_url !== route.sourceUrl || typeof data.content !== "string" || !Number.isFinite(fetchedAt)) throw new Error("缓存格式或来源不匹配");
         if (Date.now() - fetchedAt > 6 * 3600000 || fetchedAt - Date.now() > 5 * 60000) throw new Error("缓存已过期或时间无效");
+        format = data.format || "rss";
+        if (format !== route.expectedFormat) throw new Error("缓存类型与消息来源不一致");
         content = data.content;
         if (new TextEncoder().encode(content).byteLength > MAX_BYTES) throw new Error("缓存内容超过 2 MB");
       }
-      if (route.format === "rss2json") {
+      if (format === "telegram") {
+        const preview = document.createElement("template");
+        preview.innerHTML = content;
+        const channel = new URL(route.sourceUrl).pathname.split("/").filter(Boolean).at(-1).toLowerCase();
+        const valid = Array.from(preview.content.querySelectorAll(".tgme_widget_message[data-post]")).some(message => {
+          const post = message.getAttribute("data-post").split("/");
+          return post.length === 2 && post[0].toLowerCase() === channel && /^[1-9][0-9]*$/.test(post[1]) && message.querySelector(".tgme_widget_message_text")?.textContent.trim();
+        });
+        if (!valid) throw new Error("频道未返回可读取的公开文字消息");
+        return { content, format: "telegram" };
+      }
+      if (format === "rss2json") {
         const data = JSON.parse(content);
         if (data.status !== "ok" || !Array.isArray(data.items)) throw new Error("转接未返回有效资讯");
       } else {
@@ -53,7 +74,7 @@ window.BrowserNews = (() => {
         const xml = new DOMParser().parseFromString(content, "application/xml");
         if (xml.querySelector("parsererror") || !["rss", "feed", "RDF"].includes(xml.documentElement.localName)) throw new Error("来源未返回 RSS 或 Atom");
       }
-      return { content, format: route.format === "rss2json" ? "rss2json" : "rss" };
+      return { content, format: format === "rss2json" ? "rss2json" : "rss" };
     } catch (error) {
       if (controller.signal.aborted && !signal.aborted) throw new Error(`请求超过 ${duration / 1000} 秒，已超时`);
       if (error instanceof TypeError) throw new Error("浏览器无法读取响应，可能是网络或跨域限制");
@@ -67,12 +88,22 @@ window.BrowserNews = (() => {
 
   function routes(source) {
     const encoded = encodeURIComponent(source.url);
+    if (source.kind === "telegram") {
+      const options = [
+        { name: "Telegram 公开页面", url: source.url, sourceUrl: source.url, format: "telegram" },
+        { name: "AllOrigins", url: `https://api.allorigins.win/raw?url=${encoded}`, sourceUrl: source.url, format: "telegram" },
+        { name: "频道读取", url: `https://r.jina.ai/${source.url}`, sourceUrl: source.url, format: "telegram-reader", timeout: 25000,
+          headers: { Accept: "application/json", "X-Respond-With": "html" } },
+      ];
+      if (source.cache_url) options.unshift({ name: "GitHub 新闻缓存", url: source.cache_url, sourceUrl: source.url, format: "cache", expectedFormat: "telegram" });
+      return options;
+    }
     const options = [
       { name: "rss2json", url: `https://api.rss2json.com/v1/api.json?rss_url=${encoded}`, format: "rss2json" },
       { name: "AllOrigins", url: `https://api.allorigins.win/raw?url=${encoded}`, format: "rss" },
     ];
     if (new URL(source.url).hostname === "www.espn.com") options.unshift({ name: "直接读取", url: source.url, format: "rss" });
-    if (source.cache_url) options.unshift({ name: "GitHub 新闻缓存", url: source.cache_url, sourceUrl: source.url, format: "cache" });
+    if (source.cache_url) options.unshift({ name: "GitHub 新闻缓存", url: source.cache_url, sourceUrl: source.url, format: "cache", expectedFormat: "rss" });
     return options;
   }
 
