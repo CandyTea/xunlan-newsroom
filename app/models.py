@@ -129,6 +129,7 @@ class Settings(StrictModel):
 
 class FetchRequest(StrictModel):
     categories: list[Category] = Field(default_factory=lambda: list(CATEGORIES), min_length=1, max_length=4)
+    failed_only: bool = False
 
 
 class ArticlePatch(StrictModel):

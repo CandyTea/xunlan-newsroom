@@ -458,7 +458,8 @@ async function pollStatus() {
   try {
     const wasFetching = Boolean(state.status.fetching); state.status = await api("/status"); renderSidebar(); updateFetchButtons();
     if (wasFetching && !state.status.fetching) {
-      toast("收取已完成");
+      const result = state.status.last_run;
+      toast(result?.status === "partial" ? "收取完成，部分来源暂时失败；已收取的资讯可正常阅读" : result?.status === "failed" ? "本次收取失败，请稍后重试" : result?.status === "interrupted" ? "收取已中断，可重新收取" : "收取已完成");
       if (["news", "following"].includes(state.view) && !state.manageWatches) renderView();
     }
   } catch (error) { if (error.status === 401) showAuth(); } finally { state.pollBusy = false; }

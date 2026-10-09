@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .collector import Collector, fetch_config, fetch_public, rematch_watch, resolve_public_url, watch_from_row
 from .db import Database, utc_now
+from .dns import dns_mode
 from .models import ArticlePatch, CATEGORIES, Credentials, FetchRequest, Schedule, Settings, Setup, Source, Watch
 from .scheduler import Scheduler, next_run, schedule_from_row
 
@@ -100,7 +101,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await scheduler.stop()
         await collector.stop()
 
-    app = FastAPI(title="Newsroom", version="1.1.2", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.1.3", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -508,10 +509,17 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         scheduler.notify()
         return value
 
-    @app.post("/api/fetch", dependencies=[Depends(require_auth)])
-    async def fetch(body: FetchRequest):
-        accepted, run_id = await collector.start(body.categories)
+    @app.post("/api/fetch")
+    async def fetch(body: FetchRequest, request: Request, session=Depends(require_auth)):
+        if body.failed_only:
+            require_admin(request, session)
+        accepted, run_id = await collector.start(body.categories, failed_only=body.failed_only)
         return {"accepted": accepted, "run_id": run_id, "message": "采集已启动" if accepted else "已有采集正在进行，未重复启动"}
+
+    @app.get("/api/network", dependencies=[Depends(require_admin)])
+    def network():
+        mode, proxy = fetch_config()
+        return {"fetch_mode": mode, "dns_mode": dns_mode(), "proxy_configured": bool(proxy)}
 
     @app.get("/api/runs", dependencies=[Depends(require_admin)])
     def runs(limit: int = Query(30, ge=1, le=100)):
@@ -526,11 +534,12 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             following_count = conn.execute("SELECT COUNT(DISTINCT article_id) FROM article_watches").fetchone()[0]
             source_count = conn.execute("SELECT COUNT(*) FROM sources WHERE enabled=1").fetchone()[0]
             success = conn.execute("SELECT value FROM metadata WHERE key='last_success_at'").fetchone()
+            last_run = conn.execute("SELECT status,new_count,source_count FROM runs ORDER BY id DESC LIMIT 1").fetchone()
         future = [value["next_run_at"] for value in schedules_list() if value["next_run_at"]]
         return {"fetching": collector.fetching, "last_success_at": success[0] if success else None,
                 "next_run_at": min(future) if future else None, "article_count": article_count,
                 "unread_count": unread_count, "following_count": following_count, "source_count": source_count,
-                "last_error": None}
+                "last_run": dict(last_run) if last_run else None, "last_error": None}
 
     @app.get("/api/export", dependencies=[Depends(require_admin)])
     def export():

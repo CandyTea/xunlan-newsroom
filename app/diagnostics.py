@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .collector import fetch_config, fetch_public, parse_rss, parse_steam, safe_error
+from .dns import dns_mode
 from .db import load_default_sources
 from .models import CATEGORIES
 
@@ -91,7 +92,7 @@ def main(argv=None):
         return 2
 
     proxy_configured = bool(os.getenv("NEWSROOM_OUTBOUND_PROXY", "").strip())
-    print(f"抓取模式: {mode}; 已配置代理: {'是' if proxy_configured else '否'}; "
+    print(f"抓取模式: {mode}; DNS 模式: {dns_mode()}; 已配置代理: {'是' if proxy_configured else '否'}; "
           f"当前模式使用代理: {'是' if proxy else '否'}", flush=True)
     results = asyncio.run(_check_sources(selected))
     passed = sum(result["ok"] for result in results)

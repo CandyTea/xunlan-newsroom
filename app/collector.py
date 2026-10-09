@@ -17,6 +17,7 @@ import httpx
 
 from .catalog import article_topics, term_matches, watch_team
 from .db import utc_now
+from .dns import dns_mode, resolve_https
 from .models import public_url_syntax
 
 logger = logging.getLogger(__name__)
@@ -138,8 +139,27 @@ async def resolve_public_url(url, *, ip_index=0):
     hostname = parts.hostname
     port = parts.port or (443 if parts.scheme == "https" else 80)
     loop = asyncio.get_running_loop()
-    answers = await asyncio.wait_for(loop.getaddrinfo(hostname, port, type=socket.SOCK_STREAM), timeout=5)
-    addresses = list(dict.fromkeys(answer[4][0] for answer in answers))
+    mode = dns_mode()
+    try:
+        literal_address = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal_address = None
+    if literal_address is not None:
+        addresses = [str(literal_address)]
+    elif mode == "https":
+        fetch_mode, proxy = fetch_config()
+        addresses = await resolve_https(hostname, proxy, allow_direct=fetch_mode == "auto")
+    else:
+        try:
+            answers = await asyncio.wait_for(loop.getaddrinfo(hostname, port, type=socket.SOCK_STREAM), timeout=5)
+            addresses = list(dict.fromkeys(answer[4][0] for answer in answers))
+            if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+                raise ValueError("来源域名解析到了非公网地址，已拒绝访问")
+        except (OSError, TimeoutError, ValueError):
+            if mode == "system":
+                raise
+            fetch_mode, proxy = fetch_config()
+            addresses = await resolve_https(hostname, proxy, allow_direct=fetch_mode == "auto")
     if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
         raise ValueError("来源域名解析到了非公网地址，已拒绝访问")
     ipv4 = [address for address in addresses if ":" not in address]
@@ -151,6 +171,7 @@ async def resolve_public_url(url, *, ip_index=0):
 
 
 def fetch_config():
+    dns_mode()
     mode = os.getenv("NEWSROOM_FETCH_MODE", "auto").strip().lower()
     if mode not in {"auto", "direct", "proxy"}:
         raise ValueError("NEWSROOM_FETCH_MODE 必须为 auto、direct 或 proxy")
@@ -369,7 +390,7 @@ class Collector:
     def fetching(self):
         return self.task is not None and not self.task.done()
 
-    async def start(self, categories, trigger="manual", slots=None):
+    async def start(self, categories, trigger="manual", slots=None, failed_only=False):
         async with self.lock:
             if self.fetching:
                 return False, self.run_id
@@ -393,7 +414,7 @@ class Collector:
                     conn.execute("UPDATE schedule_slots SET run_id=? WHERE schedule_id=? AND scheduled_at=?", (run_id, slot["id"], slot["scheduled_at"]))
                     conn.execute("UPDATE schedules SET last_run_at=? WHERE id=?", (now, slot["id"]))
             self.run_id = run_id
-            self.task = asyncio.create_task(self.collect(run_id, categories))
+            self.task = asyncio.create_task(self.collect(run_id, categories, failed_only=failed_only))
             return True, run_id
 
     def persist_articles(self, source, articles):
@@ -420,20 +441,29 @@ class Collector:
             conn.execute("UPDATE sources SET last_success_at=?,last_error=NULL WHERE id=?", (utc_now(), source["id"]))
         return count
 
-    async def collect(self, run_id, categories):
+    async def collect(self, run_id, categories, *, failed_only=False):
         new_count = 0
         errors = []
         attempted = 0
         try:
             with self.db.connection() as conn:
                 sources = [dict(row) for row in conn.execute("SELECT * FROM sources WHERE enabled=1") if row["category"] in categories]
-            for source in sources:
+            semaphore = asyncio.Semaphore(3)
+
+            async def check_source(source):
+                async with semaphore:
+                    await collect_source(source)
+
+            async def collect_source(source):
+                nonlocal attempted, new_count
                 # Re-read so disabling/deleting a pending source takes effect immediately.
                 with self.db.connection() as conn:
                     current = conn.execute("SELECT * FROM sources WHERE id=? AND enabled=1", (source["id"],)).fetchone()
                 if current is None:
-                    continue
+                    return
                 source = dict(current)
+                if source["category"] not in categories or (failed_only and not source["last_error"]):
+                    return
                 attempted += 1
                 try:
                     data, base_url = await self.fetcher(source["url"])
@@ -450,6 +480,9 @@ class Collector:
                     with self.db.connection(write=True) as conn:
                         conn.execute("UPDATE sources SET last_error=? WHERE id=?", (error, source["id"]))
                     logger.warning("Feed %s failed (%s)", source["id"], type(exc).__name__)
+            async with asyncio.TaskGroup() as group:
+                for source in sources:
+                    group.create_task(check_source(source))
             status = "partial" if errors and len(errors) < attempted else "failed" if errors else "success"
             with self.db.connection(write=True) as conn:
                 conn.execute("UPDATE runs SET finished_at=?,status=?,new_count=?,source_count=?,error=? WHERE id=?",

@@ -156,7 +156,7 @@ class ParsingTests(unittest.TestCase):
 
 class URLTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.enterContext(patch.dict(os.environ, {"NEWSROOM_FETCH_MODE": "direct", "NEWSROOM_OUTBOUND_PROXY": ""}))
+        self.enterContext(patch.dict(os.environ, {"NEWSROOM_FETCH_MODE": "direct", "NEWSROOM_OUTBOUND_PROXY": "", "NEWSROOM_DNS_MODE": "system"}))
         self.resolver = AsyncMock(return_value=("https://example.com/feed", "https://1.1.1.1:443/feed", "example.com", "example.com"))
 
     def client_factory(self, handler, routes):
@@ -565,6 +565,82 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    async def test_slow_source_does_not_block_fast_source_and_stop_cancels_workers(self):
+        fast = add_source(self.db, "Fast")
+        with self.db.connection(write=True) as conn:
+            conn.execute("UPDATE sources SET url='https://example.com/fast' WHERE id=?", (fast["id"],))
+        fast_done = asyncio.Event()
+        slow_started = asyncio.Event()
+        gate = asyncio.Event()
+        cancelled = asyncio.Event()
+        async def fetcher(url):
+            if url.endswith("/fast"):
+                fast_done.set()
+                return RSS, url
+            slow_started.set()
+            try:
+                await gate.wait()
+            finally:
+                cancelled.set()
+        collector = Collector(self.db, fetcher)
+        await collector.start(["games"])
+        try:
+            await asyncio.wait_for(fast_done.wait(), timeout=1)
+            await asyncio.wait_for(slow_started.wait(), timeout=1)
+            with self.db.connection() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0], 2)
+        finally:
+            await collector.stop()
+        self.assertTrue(cancelled.is_set())
+        with self.db.connection() as conn:
+            self.assertEqual(conn.execute("SELECT status FROM runs").fetchone()[0], "interrupted")
+
+    async def test_parallel_collection_is_bounded_and_pending_disable_is_respected(self):
+        sources = [self.source, *(add_source(self.db, f"Source {i}") for i in range(5))]
+        gate = asyncio.Event()
+        three_started = asyncio.Event()
+        active = peak = calls = 0
+        async def fetcher(url):
+            nonlocal active, peak, calls
+            active += 1
+            calls += 1
+            peak = max(peak, active)
+            if active == 3:
+                three_started.set()
+            try:
+                await gate.wait()
+                return RSS, url
+            finally:
+                active -= 1
+        collector = Collector(self.db, fetcher)
+        await collector.start(["games"])
+        try:
+            await asyncio.wait_for(three_started.wait(), timeout=1)
+            with self.db.connection(write=True) as conn:
+                conn.execute("UPDATE sources SET enabled=0 WHERE id=?", (sources[-1]["id"],))
+            gate.set()
+            await collector.task
+        finally:
+            await collector.stop()
+        self.assertEqual((peak, calls, active), (3, 5, 0))
+
+    async def test_retry_failed_sources_skips_healthy_disabled_and_other_categories(self):
+        healthy = add_source(self.db, "Healthy")
+        disabled = add_source(self.db, "Disabled")
+        sports = add_source(self.db, "Sports", "sports")
+        with self.db.connection(write=True) as conn:
+            conn.execute("UPDATE sources SET last_error='temporary' WHERE id IN (?,?,?)", (self.source["id"], disabled["id"], sports["id"]))
+            conn.execute("UPDATE sources SET enabled=0 WHERE id=?", (disabled["id"],))
+        fetcher = AsyncMock(return_value=(RSS, "https://example.com/feed"))
+        collector = Collector(self.db, fetcher)
+        await collector.start(["games"], failed_only=True)
+        await collector.task
+        fetcher.assert_awaited_once()
+        with self.db.connection() as conn:
+            self.assertIsNone(conn.execute("SELECT last_error FROM sources WHERE id=?", (self.source["id"],)).fetchone()[0])
+            self.assertEqual(tuple(conn.execute("SELECT status,source_count,new_count FROM runs").fetchone()), ("success", 1, 2))
+            self.assertIsNone(conn.execute("SELECT last_success_at FROM sources WHERE id=?", (healthy["id"],)).fetchone()[0])
+
     async def test_overlapping_runs_dedup_and_article_state_survives(self):
         gate = asyncio.Event()
         async def fetcher(url):
@@ -798,7 +874,8 @@ class APITests(unittest.TestCase):
         routes = [("GET", "/api/sources", None), ("POST", "/api/sources", {"name": "Feed", "url": "https://example.com/", "category": "games"}),
                   ("PUT", "/api/sources/1", {"name": "Feed", "url": "https://example.com/", "category": "games"}),
                   ("DELETE", "/api/sources/1", None), ("GET", "/api/settings", None), ("PUT", "/api/settings", {"timezone": "UTC"}),
-                  ("GET", "/api/runs", None), ("GET", "/api/export", None)]
+                  ("GET", "/api/runs", None), ("GET", "/api/export", None), ("GET", "/api/network", None),
+                  ("POST", "/api/fetch", {"failed_only": True})]
         anonymous = TestClient(self.app)
         for method, path, body in routes:
             with self.subTest(method=method, path=path):
@@ -809,6 +886,17 @@ class APITests(unittest.TestCase):
         with self.db.connection(write=True) as conn:
             conn.execute("INSERT INTO runs(trigger,started_at,status,error) VALUES('manual','2026-01-01','failed','sensitive source error')")
         self.assertIsNone(self.client.get("/api/status").json()["last_error"])
+
+    def test_admin_network_hides_credentials_and_retry_passes_selection(self):
+        self.become_admin()
+        with patch.dict(os.environ, {"NEWSROOM_FETCH_MODE": "proxy", "NEWSROOM_OUTBOUND_PROXY": "http://user:secret@proxy.example:8080", "NEWSROOM_DNS_MODE": "fallback"}):
+            result = self.client.get("/api/network")
+        self.assertEqual(result.json(), {"fetch_mode": "proxy", "dns_mode": "fallback", "proxy_configured": True})
+        self.assertNotIn("secret", result.text)
+        with patch.object(self.app.state.collector, "start", AsyncMock(return_value=(True, 123))) as start:
+            response = self.client.post("/api/fetch", json={"categories": ["sports"], "failed_only": True}, headers=self.headers)
+        self.assertEqual(response.json()["run_id"], 123)
+        start.assert_awaited_once_with(["sports"], failed_only=True)
 
     def test_admin_requires_credentials_again_and_csrf(self):
         credentials = {"username": "reader", "password": "test-password-123"}

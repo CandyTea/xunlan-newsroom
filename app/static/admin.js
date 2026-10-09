@@ -1,7 +1,7 @@
 "use strict";
 
 const CATEGORIES = { games: "游戏", sports: "体育", stocks: "股票", politics: "政治" };
-const state = { reader: null, grant: null, settings: { timezone: "Asia/Shanghai", catch_up: true, catch_up_hours: 4 }, sources: [], status: {}, renderId: 0, polling: false, toastTimer: null };
+const state = { reader: null, grant: null, settings: { timezone: "Asia/Shanghai", catch_up: true, catch_up_hours: 4 }, sources: [], status: {}, network: {}, retrying: false, renderId: 0, polling: false, toastTimer: null };
 const $ = (selector, root = document) => root.querySelector(selector);
 const main = $("#admin-main");
 const modal = $("#modal");
@@ -101,16 +101,54 @@ function section(title, copy, content, action) { return el("section", { class: "
 async function renderAdmin() {
   const id = ++state.renderId; main.replaceChildren(loading());
   try {
-    const [settings, sources, runs, status] = await Promise.all([api("/settings"), api("/sources"), api("/runs?limit=30"), api("/status")]);
+    const [settings, sources, runs, status, network] = await Promise.all([api("/settings"), api("/sources"), api("/runs?limit=30"), api("/status"), api("/network")]);
     if (id !== state.renderId || !state.grant?.authenticated) return;
-    state.settings = settings; state.sources = sources.items || []; state.status = status; updateExpiry();
-    main.replaceChildren(el("div", { class: "view-heading" }, el("div", {}, [el("h1", { text: "收取管理" }), el("p", { text: "管理来源、服务端收取偏好与执行记录。" })])), section("资讯来源", "仅支持公开 RSS / Atom 与 Steam 官方资讯。", state.sources.length ? el("div", { class: "manage-list sources-list" }, state.sources.map(sourceRow)) : el("p", { class: "inline-empty", text: "还没有来源。添加公开订阅地址或 Steam 游戏 App ID。" }), button("添加来源", () => sourceForm(), "button button-small", "plus")), section("服务端收取偏好", "时区影响所有收取计划，补收会合并遗漏的任务。", settingsForm()), section("收取状态", "计划与手动收取共用已启用的来源。", el("div", { id: "admin-status" }, statusBox())), section("最近收取记录", "成功来源会保留资讯；失败原因记录在这里。", el("div", { id: "run-history" }, runTable(runs.items || [])), button("刷新", refreshRuns, "button button-small", "refresh")), section("配置导出", "导出来源、关注、计划与偏好；文件不含账号密码。", button("导出配置", exportConfig, "button", "download")));
+    state.settings = settings; state.sources = sources.items || []; state.status = status; state.network = network; updateExpiry();
+    main.replaceChildren(
+      el("div", { class: "view-heading" }, el("div", {}, [el("h1", { text: "收取管理" }), el("p", { text: "管理来源、服务端收取偏好与执行记录。" })])),
+      section("来源连接", "收取由服务器执行，不使用手机或电脑浏览器的网络。", networkBox()),
+      section("资讯来源", "仅支持公开 RSS / Atom 与 Steam 官方资讯。", el("div", { id: "source-list", class: "manage-list sources-list" }, state.sources.length ? state.sources.map(sourceRow) : el("p", { class: "inline-empty", text: "还没有来源。添加公开订阅地址或 Steam 游戏 App ID。" })), button("添加来源", () => sourceForm(), "button button-small", "plus")),
+      section("服务端收取偏好", "时区影响所有收取计划，补收会合并遗漏的任务。", settingsForm()),
+      section("收取状态", "计划与手动收取共用已启用的来源。", el("div", { id: "admin-status" }, statusBox())),
+      section("最近收取记录", "成功来源会保留资讯；失败原因记录在这里。", el("div", { id: "run-history" }, runTable(runs.items || [])), button("刷新", refreshRuns, "button button-small", "refresh")),
+      section("配置导出", "导出来源、关注、计划与偏好；文件不含账号密码。", button("导出配置", exportConfig, "button", "download"))
+    );
   } catch (error) {
     if (id === state.renderId && ![401, 403].includes(error.status)) main.replaceChildren(el("div", { class: "error-state", role: "alert" }, [el("strong", { text: "暂时无法载入" }), el("p", { text: error.message }), button("重试", renderAdmin, "button", "refresh")]));
   }
 }
+function sourceHint(error) {
+  if (!error) return "";
+  if (/DNS|域名解析|非公网/.test(error)) return "检查域名解析；备用解析也失败时，需检查服务器网络。";
+  if (/HTTP 403/.test(error)) return "来源拒绝了访问；稍后再试或检查来源的访问限制。";
+  if (/HTTP 404/.test(error)) return "订阅地址可能已变更，请核对来源官方网站。";
+  if (/XML|JSON|格式|内容/.test(error)) return "返回内容不是有效订阅数据，请核对订阅地址。";
+  if (/超时|连接/.test(error)) return "可重试失败来源；持续失败时需检查服务器出口或已配置的代理。";
+  return "请核对来源地址和最近收取记录。";
+}
+function networkBox() {
+  const failed = state.sources.filter(source => source.enabled && source.last_error).length;
+  const modes = { auto: "自动选择", direct: "直连", proxy: "代理" };
+  const dnsModes = { fallback: "系统解析，失败时使用备用加密 DNS", system: "系统 DNS", https: "加密 DNS" };
+  return el("div", { id: "source-network", class: "status-box" }, [
+    el("p", { class: "status-line", text: `连接方式：${modes[state.network.fetch_mode] || "未知"}；${state.network.proxy_configured ? "已配置代理" : "未配置代理"}` }),
+    el("p", { class: "status-line", text: `域名解析：${dnsModes[state.network.dns_mode] || "未知"}` }),
+    el("p", { class: "field-caption", text: "备用 DNS 只处理解析故障，不提供代理出口。持续超时需要检查服务器能否连接该来源。" }),
+    el("div", { class: "source-retry-actions" }, [el("span", { class: "muted", text: `${failed} 个启用来源收取失败` }), button("重试失败来源", retryFailedSources, "button button-small", "refresh", { disabled: !failed || state.status.fetching || state.retrying })])
+  ]);
+}
+async function retryFailedSources() {
+  if (state.status.fetching || state.retrying) return;
+  state.retrying = true;
+  const box = $("#source-network"); if (box) box.replaceWith(networkBox());
+  try {
+    const result = await api("/fetch", { method: "POST", body: { categories: Object.keys(CATEGORIES), failed_only: true } });
+    state.status.fetching = true; toast(result.message); await renderAdmin();
+  } catch (error) { showError(error); }
+  finally { state.retrying = false; const target = $("#source-network"); if (target) target.replaceWith(networkBox()); }
+}
 function sourceRow(source) {
-  return el("article", { class: "manage-row" }, [el("div", { class: "manage-copy" }, [el("h3", { class: source.enabled ? "" : "disabled-text" }, [source.name, el("span", { class: "manage-type", text: `${CATEGORIES[source.category] || "资讯"} · ${source.kind === "steam" ? "Steam" : "RSS"}` })]), el("p", { class: "source-url", text: source.kind === "steam" ? `Steam App ID：${source.steam_appid || "未设置"}` : source.url }), el("p", { text: source.last_success_at ? `最近成功：${dateTime(source.last_success_at)}` : "尚未收取" }), source.last_error && el("p", { class: "source-error", text: source.last_error }), !source.enabled && el("span", { class: "enabled-label off", text: "已停用" })]), el("div", { class: "row-actions" }, [button("", () => sourceForm(source), "icon-button", "edit", { "aria-label": `编辑来源 ${source.name}` }), button("", () => deleteSource(source), "icon-button", "trash", { "aria-label": `删除来源 ${source.name}` })])]);
+  return el("article", { class: "manage-row" }, [el("div", { class: "manage-copy" }, [el("h3", { class: source.enabled ? "" : "disabled-text" }, [source.name, el("span", { class: "manage-type", text: `${CATEGORIES[source.category] || "资讯"} · ${source.kind === "steam" ? "Steam" : "RSS"}` })]), el("p", { class: "source-url", text: source.kind === "steam" ? `Steam App ID：${source.steam_appid || "未设置"}` : source.url }), el("p", { text: source.last_success_at ? `最近成功：${dateTime(source.last_success_at)}` : "尚未收取" }), source.last_error && el("p", { class: "source-error", text: source.last_error }), source.last_error && el("p", { class: "muted", text: sourceHint(source.last_error) }), !source.enabled && el("span", { class: "enabled-label off", text: "已停用" })]), el("div", { class: "row-actions" }, [button("", () => sourceForm(source), "icon-button", "edit", { "aria-label": `编辑来源 ${source.name}` }), button("", () => deleteSource(source), "icon-button", "trash", { "aria-label": `删除来源 ${source.name}` })])]);
 }
 function sourceForm(source = {}) {
   const kind = select("kind", { rss: "公开 RSS / Atom", steam: "Steam 官方游戏资讯" }, source.kind || "rss");
@@ -161,7 +199,7 @@ function statusBox() {
 }
 function runTable(runs) {
   if (!runs.length) return el("p", { class: "inline-empty", text: "尚无收取记录。在阅读室手动收取，或等待已启用的计划。" });
-  const names = { running: "进行中", success: "成功", completed: "成功", failed: "失败", partial: "部分成功", error: "失败" };
+  const names = { running: "进行中", success: "成功", completed: "成功", failed: "失败", partial: "部分成功", error: "失败", interrupted: "已中断" };
   const triggers = { manual: "手动收取", schedule: "定时计划", scheduled: "定时计划", catch_up: "遗漏补收", catchup: "遗漏补收" };
   return el("table", { class: "run-table" }, [el("caption", { class: "skip-link", text: "最近收取记录" }), el("thead", {}, el("tr", {}, [el("th", { scope: "col", text: "时间 / 触发" }), el("th", { scope: "col", text: "结果" }), el("th", { scope: "col", text: "新增" })])), el("tbody", {}, runs.map(run => el("tr", {}, [el("td", {}, [el("time", { datetime: run.started_at, text: dateTime(run.started_at) }), el("div", { class: "muted", text: triggers[run.trigger] || run.trigger || "收取" })]), el("td", {}, [el("span", { class: `run-status ${["success", "completed"].includes(run.status) ? "success" : ["failed", "error"].includes(run.status) ? "failed" : run.status === "partial" ? "partial" : ""}`, text: names[run.status] || run.status }), run.error && el("div", { class: "run-error", text: run.error }), run.source_count !== undefined && el("div", { class: "muted", text: `${run.source_count} 个来源` })]), el("td", { text: run.new_count == null ? "—" : `${run.new_count} 条` })])))]);
 }
@@ -179,6 +217,17 @@ async function pollAdmin() {
     const completed = state.status.fetching && !status.fetching; state.status = status;
     const box = $("#admin-status"); if (box) box.replaceChildren(statusBox());
     if (status.fetching || completed) await refreshRuns();
+    if (completed) {
+      const sources = await api("/sources");
+      if (!state.grant?.authenticated) return;
+      state.sources = sources.items || [];
+      const list = $("#source-list");
+      if (list) {
+        if (state.sources.length) list.replaceChildren(...state.sources.map(sourceRow));
+        else list.replaceChildren(el("p", { class: "inline-empty", text: "还没有来源。添加公开订阅地址或 Steam 游戏 App ID。" }));
+      }
+    }
+    const network = $("#source-network"); if (network) network.replaceWith(networkBox());
   } catch (error) { showError(error); } finally { state.polling = false; }
 }
 $("#modal-close").addEventListener("click", closeModal);
