@@ -16,7 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .collector import Collector, fetch_public, rematch_watch, resolve_public_url, watch_from_row
+from .collector import Collector, fetch_config, fetch_public, rematch_watch, resolve_public_url, watch_from_row
 from .db import Database, utc_now
 from .models import ArticlePatch, CATEGORIES, Credentials, FetchRequest, Schedule, Settings, Setup, Source, Watch
 from .scheduler import Scheduler, next_run, schedule_from_row
@@ -80,6 +80,7 @@ class BodyLimitMiddleware:
 
 
 def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
+    fetch_config()
     db = Database(Path(data_dir or os.getenv("NEWSROOM_DATA_DIR", ROOT / "data")) / "newsroom.sqlite3")
     db.initialize()
     collector = Collector(db, fetcher)
@@ -99,7 +100,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await scheduler.stop()
         await collector.stop()
 
-    app = FastAPI(title="Newsroom", version="1.1.1", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.1.2", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector

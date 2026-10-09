@@ -21,6 +21,10 @@ from .models import public_url_syntax
 
 logger = logging.getLogger(__name__)
 MAX_BYTES = 2 * 1024 * 1024
+FETCH_BUDGET = 70
+FETCH_ATTEMPT_TIMEOUT = 25
+FETCH_ATTEMPTS = 4
+RETRY_STATUSES = {429, 502, 503, 504}
 
 
 class PlainText(HTMLParser):
@@ -127,7 +131,7 @@ def rematch_watch(conn, watch_id, catalog=None):
                 conn.execute("INSERT INTO article_watches(article_id,watch_id) VALUES(?,?)", (article["id"], watch_id))
 
 
-async def resolve_public_url(url):
+async def resolve_public_url(url, *, ip_index=0):
     """Validate every DNS answer and return an IP-pinned URL plus TLS/Host identity."""
     url = public_url_syntax(url)
     parts = urlsplit(url)
@@ -138,48 +142,108 @@ async def resolve_public_url(url):
     addresses = list(dict.fromkeys(answer[4][0] for answer in answers))
     if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
         raise ValueError("来源域名解析到了非公网地址，已拒绝访问")
-    address = next((address for address in addresses if ":" not in address), addresses[0])
+    ipv4 = [address for address in addresses if ":" not in address]
+    addresses = ipv4 or addresses
+    address = addresses[ip_index % len(addresses)]
     address = f"[{address}]" if ":" in address else address
     pinned = urlunsplit((parts.scheme, f"{address}:{port}", parts.path, parts.query, ""))
     return url, pinned, parts.netloc, hostname
 
 
+def fetch_config():
+    mode = os.getenv("NEWSROOM_FETCH_MODE", "auto").strip().lower()
+    if mode not in {"auto", "direct", "proxy"}:
+        raise ValueError("NEWSROOM_FETCH_MODE 必须为 auto、direct 或 proxy")
+    if mode == "direct":
+        return mode, None
+    proxy = os.getenv("NEWSROOM_OUTBOUND_PROXY", "").strip() or None
+    if mode == "proxy" and not proxy:
+        raise ValueError("proxy 模式需要配置 NEWSROOM_OUTBOUND_PROXY")
+    if proxy:
+        try:
+            parts = urlsplit(proxy)
+            if parts.scheme not in {"http", "https"} or not parts.hostname or parts.port == 0:
+                raise ValueError()
+            httpx.Proxy(proxy)
+        except (ValueError, httpx.InvalidURL):
+            raise ValueError("NEWSROOM_OUTBOUND_PROXY 必须为有效的 HTTP(S) 代理地址") from None
+    return mode, proxy
+
+
+def retry_delay(response, attempt):
+    delay = 0.5 * 2 ** attempt
+    if response is None:
+        return delay
+    retry_after = response.headers.get("retry-after", "").strip()
+    if retry_after.isdigit():
+        return max(delay, float(retry_after))
+    if retry_after:
+        try:
+            retry_at = parsedate_to_datetime(retry_after)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(delay, (retry_at - datetime.now(timezone.utc)).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return delay
+
+
 async def fetch_public(url):
-    async with asyncio.timeout(35):
-        for _ in range(6):
-            original, pinned, host, hostname = await resolve_public_url(url)
+    mode, proxy = fetch_config()
+    routes = [proxy, None] if mode == "auto" and proxy else [proxy]
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + FETCH_BUDGET
+    redirects = 0
+    async with asyncio.timeout(FETCH_BUDGET):
+        for attempt in range(FETCH_ATTEMPTS):
+            try:
+                async with asyncio.timeout(FETCH_ATTEMPT_TIMEOUT):
+                    while True:
+                        original, pinned, host, hostname = await resolve_public_url(url, ip_index=attempt // len(routes))
 
-            async def tls_identity(event, info):
-                # httpcore 1.0.9's CONNECT transport omits sni_hostname.
-                # Its trace hook runs before TLS with the actual kwargs,
-                # allowing the tunnel to retain normal certificate checks.
-                if event == "proxy.start_tls.started":
-                    info["server_hostname"] = hostname
+                        async def tls_identity(event, info):
+                            # httpcore 1.0.9's CONNECT transport omits sni_hostname.
+                            # The hook keeps normal certificate checks for the origin.
+                            if event == "proxy.start_tls.started":
+                                info["server_hostname"] = hostname
 
-            # A new pool per redirect keeps TLS identities separate when two
-            # different hostnames happen to resolve to the same public IP.
-            async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=8), trust_env=False, follow_redirects=False,
-                                         proxy=os.getenv("NEWSROOM_OUTBOUND_PROXY") or None) as client:
-                async with client.stream("GET", pinned, headers={"Host": host, "User-Agent": "Newsroom/1.0 (personal RSS reader)",
-                                                               "Accept": "application/rss+xml,application/atom+xml,application/json,text/xml,*/*"},
-                                         extensions={"sni_hostname": hostname, "trace": tls_identity}) as response:
-                    if response.status_code in (301, 302, 303, 307, 308):
-                        location = response.headers.get("location")
-                        if not location:
-                            raise ValueError("来源返回了不含目标地址的跳转")
-                        url = urljoin(original, location)
-                        continue
-                    response.raise_for_status()
-                    length = response.headers.get("content-length", "")
-                    if length.isdigit() and int(length) > MAX_BYTES:
-                        raise ValueError("来源响应超过 2 MB 上限")
-                    data = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        data.extend(chunk)
-                        if len(data) > MAX_BYTES:
-                            raise ValueError("来源响应超过 2 MB 上限")
-                    return bytes(data), original
-        raise ValueError("来源跳转次数超过上限")
+                        # Separate pools retain each redirect's TLS identity, even
+                        # when different hostnames resolve to the same public IP.
+                        async with httpx.AsyncClient(timeout=httpx.Timeout(20, connect=10), trust_env=False,
+                                                     follow_redirects=False, proxy=routes[attempt % len(routes)]) as client:
+                            async with client.stream("GET", pinned,
+                                                     headers={"Host": host, "User-Agent": "Newsroom/1.0 (personal RSS reader)",
+                                                              "Accept": "application/rss+xml,application/atom+xml,application/json,text/xml,*/*"},
+                                                     extensions={"sni_hostname": hostname, "trace": tls_identity}) as response:
+                                if response.status_code in (301, 302, 303, 307, 308):
+                                    location = response.headers.get("location")
+                                    if not location:
+                                        raise ValueError("来源返回了不含目标地址的跳转")
+                                    redirects += 1
+                                    if redirects >= 6:
+                                        raise ValueError("来源跳转次数超过上限")
+                                    url = urljoin(original, location)
+                                    continue
+                                response.raise_for_status()
+                                length = response.headers.get("content-length", "")
+                                if length.isdigit() and int(length) > MAX_BYTES:
+                                    raise ValueError("来源响应超过 2 MB 上限")
+                                data = bytearray()
+                                async for chunk in response.aiter_bytes():
+                                    data.extend(chunk)
+                                    if len(data) > MAX_BYTES:
+                                        raise ValueError("来源响应超过 2 MB 上限")
+                                return bytes(data), original
+            except (TimeoutError, httpx.TimeoutException, httpx.ConnectError, httpx.ProxyError,
+                    httpx.RemoteProtocolError, httpx.HTTPStatusError, socket.gaierror) as exc:
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code not in RETRY_STATUSES:
+                    raise
+                if isinstance(exc, socket.gaierror) and exc.errno != socket.EAI_AGAIN:
+                    raise
+                delay = retry_delay(exc.response if isinstance(exc, httpx.HTTPStatusError) else None, attempt)
+                if attempt == FETCH_ATTEMPTS - 1 or delay >= deadline - loop.time():
+                    raise
+            await asyncio.sleep(delay)
 
 
 def _local(tag):
@@ -282,6 +346,8 @@ def safe_error(exc):
         return "来源请求超时"
     if isinstance(exc, (httpx.ConnectError, socket.gaierror)):
         return "无法连接来源，请检查域名、网络或服务器出口"
+    if isinstance(exc, httpx.ProxyError):
+        return "无法通过代理连接来源，请检查代理服务或出口设置"
     if isinstance(exc, ET.ParseError):
         return "来源 XML 格式无效"
     if isinstance(exc, json.JSONDecodeError):

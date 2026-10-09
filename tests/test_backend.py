@@ -6,7 +6,8 @@ import socket
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -14,7 +15,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.catalog import article_topics, load_catalog
-from app.collector import Collector, canonical_url, fetch_public, matches_watch, parse_rss, parse_steam, rematch_watch, resolve_public_url
+from app.collector import Collector, MAX_BYTES, canonical_url, fetch_config, fetch_public, matches_watch, parse_rss, parse_steam, rematch_watch, resolve_public_url, safe_error
 from app.db import Database, load_default_sources
 from app.main import ADMIN_COOKIE_NAME, COOKIE_NAME, create_app, password_hash, token_hash
 from app.models import Source, public_url_syntax
@@ -154,6 +155,21 @@ class ParsingTests(unittest.TestCase):
 
 
 class URLTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.enterContext(patch.dict(os.environ, {"NEWSROOM_FETCH_MODE": "direct", "NEWSROOM_OUTBOUND_PROXY": ""}))
+        self.resolver = AsyncMock(return_value=("https://example.com/feed", "https://1.1.1.1:443/feed", "example.com", "example.com"))
+
+    def client_factory(self, handler, routes):
+        real_client = httpx.AsyncClient
+        def factory(**kwargs):
+            routes.append(kwargs["proxy"])
+            self.assertFalse(kwargs["trust_env"])
+            self.assertFalse(kwargs["follow_redirects"])
+            self.assertEqual(kwargs["timeout"].connect, 10)
+            self.assertEqual(kwargs["timeout"].read, 20)
+            return real_client(transport=httpx.MockTransport(handler), trust_env=False)
+        return factory
+
     def test_private_and_credential_urls_rejected(self):
         for url in ("http://127.0.0.1/feed", "http://10.0.0.1/", "http://169.254.169.254/", "http://[::1]/", "http://user:secret@example.com/", "file:///etc/passwd", "http://localhost/", "https://example.com:8080/", "http://example.local/"):
             with self.subTest(url=url), self.assertRaises(ValueError):
@@ -161,11 +177,12 @@ class URLTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mixed_public_private_dns_rejected(self):
         loop = asyncio.get_running_loop()
-        answers = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443)),
-                   (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
-        with patch.object(loop, "getaddrinfo", AsyncMock(return_value=answers)):
-            with self.assertRaises(ValueError):
-                await resolve_public_url("https://example.com/feed")
+        for family, private in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+            answers = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443)),
+                       (family, socket.SOCK_STREAM, 6, "", (private, 443))]
+            with self.subTest(private=private), patch.object(loop, "getaddrinfo", AsyncMock(return_value=answers)):
+                with self.assertRaises(ValueError):
+                    await resolve_public_url("https://example.com/feed")
 
     async def test_public_ip_is_pinned_with_original_identity(self):
         loop = asyncio.get_running_loop()
@@ -175,6 +192,15 @@ class URLTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pinned, "https://1.1.1.1:443/feed")
         self.assertEqual(host, "example.com")
         self.assertEqual(hostname, "example.com")
+
+    async def test_ipv6_only_dns_is_pinned_and_rotated(self):
+        loop = asyncio.get_running_loop()
+        addresses = ("2606:4700:4700::1111", "2606:4700:4700::1001")
+        answers = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (address, 443, 0, 0)) for address in addresses]
+        with patch.object(loop, "getaddrinfo", AsyncMock(return_value=answers)):
+            original, pinned, host, hostname = await resolve_public_url("https://example.com/feed", ip_index=1)
+        self.assertEqual(pinned, "https://[2606:4700:4700::1001]:443/feed")
+        self.assertEqual((original, host, hostname), ("https://example.com/feed", "example.com", "example.com"))
 
     async def test_redirect_to_private_is_not_requested(self):
         calls = []
@@ -194,13 +220,340 @@ class URLTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0].extensions["sni_hostname"], "example.com")
 
     async def test_download_size_cap(self):
+        calls = []
         def handler(request):
+            calls.append(request)
             return httpx.Response(200, headers={"content-length": "3000000"}, content=b"large")
         real_client = httpx.AsyncClient
         resolver = AsyncMock(return_value=("https://example.com/feed", "https://1.1.1.1/feed", "example.com", "example.com"))
         with patch("app.collector.resolve_public_url", resolver), patch("app.collector.httpx.AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(handler))):
             with self.assertRaisesRegex(ValueError, "2 MB"):
                 await fetch_public("https://example.com/feed")
+        self.assertEqual(len(calls), 1)
+
+    async def test_network_failures_retry_and_recover(self):
+        for error_type in (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError, httpx.ProxyError):
+            with self.subTest(error_type=error_type):
+                requests, routes = [], []
+                def handler(request):
+                    requests.append(request)
+                    if len(requests) == 1:
+                        raise error_type("temporary failure", request=request)
+                    return httpx.Response(200, content=RSS)
+                factory = self.client_factory(handler, routes)
+                with patch("app.collector.resolve_public_url", self.resolver), patch("app.collector.httpx.AsyncClient", factory), \
+                     patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+                    data, original = await fetch_public("https://example.com/feed")
+                self.assertEqual((data, original), (RSS, "https://example.com/feed"))
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(routes, [None, None])
+                sleep.assert_awaited_once_with(0.5)
+
+    async def test_auto_falls_back_to_direct_and_rotates_each_routes_ips(self):
+        requests, routes = [], []
+        proxy = "http://user:proxy-secret@proxy.example:8080"
+        def handler(request):
+            requests.append(request)
+            if len(requests) < 4:
+                raise httpx.ConnectError("temporary failure", request=request)
+            return httpx.Response(200, content=RSS)
+        answers = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443)) for address in ("1.1.1.1", "8.8.8.8")]
+        loop = asyncio.get_running_loop()
+        with patch.dict(os.environ, {"NEWSROOM_FETCH_MODE": "auto", "NEWSROOM_OUTBOUND_PROXY": proxy}), \
+             patch.object(loop, "getaddrinfo", AsyncMock(return_value=answers)) as dns, \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+             patch("app.collector.asyncio.sleep", AsyncMock()):
+            data, original = await fetch_public("https://example.com/feed")
+        self.assertEqual((data, original), (RSS, "https://example.com/feed"))
+        self.assertEqual(routes, [proxy, None, proxy, None])
+        self.assertEqual([request.url.host for request in requests], ["1.1.1.1", "1.1.1.1", "8.8.8.8", "8.8.8.8"])
+        self.assertEqual(dns.await_count, 4)
+        for request in requests:
+            self.assertEqual(request.headers["host"], "example.com")
+            self.assertEqual(request.extensions["sni_hostname"], "example.com")
+            info = {"server_hostname": request.url.host}
+            await request.extensions["trace"]("proxy.start_tls.started", info)
+            self.assertEqual(info["server_hostname"], "example.com")
+
+    async def test_proxy_mode_never_falls_back_to_direct(self):
+        requests, routes = [], []
+        proxy = "http://proxy.example:8080"
+        def handler(request):
+            requests.append(request)
+            raise httpx.ProxyError("cannot connect through proxy", request=request)
+        with patch.dict(os.environ, {"NEWSROOM_FETCH_MODE": "proxy", "NEWSROOM_OUTBOUND_PROXY": proxy}), \
+             patch("app.collector.resolve_public_url", self.resolver), \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+             patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+            with self.assertRaises(httpx.ProxyError):
+                await fetch_public("https://example.com/feed")
+        self.assertEqual(routes, [proxy] * 4)
+        self.assertEqual(len(requests), 4)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [0.5, 1, 2])
+
+    async def test_direct_and_auto_without_explicit_proxy_ignore_environment_proxies(self):
+        for mode in ("direct", "auto"):
+            with self.subTest(mode=mode):
+                routes = []
+                def handler(request):
+                    return httpx.Response(200, content=RSS)
+                with patch.dict(os.environ, {"NEWSROOM_FETCH_MODE": mode, "NEWSROOM_OUTBOUND_PROXY": "invalid" if mode == "direct" else "",
+                                             "HTTP_PROXY": "http://ambient.invalid", "HTTPS_PROXY": "http://ambient.invalid"}), \
+                     patch("app.collector.resolve_public_url", self.resolver), \
+                     patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)):
+                    await fetch_public("https://example.com/feed")
+                self.assertEqual(routes, [None])
+
+    async def test_direct_retry_rotates_ipv4_without_switching_to_ipv6(self):
+        requests, routes = [], []
+        def handler(request):
+            requests.append(request)
+            if len(requests) < 3:
+                raise httpx.ConnectError("unreachable", request=request)
+            return httpx.Response(200, content=RSS)
+        answers = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:4700:4700::1111", 443, 0, 0)),
+                   (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443)),
+                   (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+        loop = asyncio.get_running_loop()
+        with patch.object(loop, "getaddrinfo", AsyncMock(return_value=answers)), \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+             patch("app.collector.asyncio.sleep", AsyncMock()):
+            await fetch_public("https://example.com/feed")
+        self.assertEqual([request.url.host for request in requests], ["1.1.1.1", "8.8.8.8", "1.1.1.1"])
+
+    async def test_dns_is_revalidated_before_retry_and_mixed_answers_stop(self):
+        requests, routes = [], []
+        def handler(request):
+            requests.append(request)
+            raise httpx.ConnectError("unreachable", request=request)
+        public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443))]
+        mixed = [*public, (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+        loop = asyncio.get_running_loop()
+        with patch.object(loop, "getaddrinfo", AsyncMock(side_effect=[public, mixed])) as dns, \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+             patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+            with self.assertRaisesRegex(ValueError, "非公网"):
+                await fetch_public("https://example.com/feed")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(dns.await_count, 2)
+        sleep.assert_awaited_once()
+
+    async def test_temporary_http_errors_respect_retry_after(self):
+        cases = [(429, "3", 3), (502, None, 0.5), (503, "invalid", 0.5), (504, "0", 0.5)]
+        for status, retry_after, expected in cases:
+            with self.subTest(status=status):
+                requests, routes = [], []
+                def handler(request):
+                    requests.append(request)
+                    if len(requests) == 1:
+                        return httpx.Response(status, headers={"retry-after": retry_after} if retry_after else {})
+                    return httpx.Response(200, content=RSS)
+                with patch("app.collector.resolve_public_url", self.resolver), \
+                     patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+                     patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+                    await fetch_public("https://example.com/feed")
+                self.assertEqual(len(requests), 2)
+                sleep.assert_awaited_once_with(expected)
+
+    async def test_retry_after_http_date_and_excessive_delay(self):
+        routes = []
+        retry_at = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=10), usegmt=True)
+        requests = []
+        def handler(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(429, headers={"retry-after": retry_at})
+            return httpx.Response(200, content=RSS)
+        with patch("app.collector.resolve_public_url", self.resolver), \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+             patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+            await fetch_public("https://example.com/feed")
+        self.assertGreater(sleep.await_args.args[0], 8)
+        self.assertLessEqual(sleep.await_args.args[0], 10)
+        requests.clear()
+        retry_at = "3600"
+        with patch("app.collector.resolve_public_url", self.resolver), \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, [])), \
+             patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+            with self.assertRaises(httpx.HTTPStatusError):
+                await fetch_public("https://example.com/feed")
+        self.assertEqual(len(requests), 1)
+        sleep.assert_not_awaited()
+
+    async def test_permanent_http_errors_do_not_retry(self):
+        for status in (400, 401, 403, 404):
+            with self.subTest(status=status):
+                routes = []
+                def handler(request):
+                    return httpx.Response(status)
+                with patch("app.collector.resolve_public_url", self.resolver), \
+                     patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+                     patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+                    with self.assertRaises(httpx.HTTPStatusError):
+                        await fetch_public("https://example.com/feed")
+                self.assertEqual(routes, [None])
+                sleep.assert_not_awaited()
+
+    async def test_streaming_size_cap_does_not_retry(self):
+        class LargeStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"a" * MAX_BYTES
+                yield b"overflow"
+        routes = []
+        def handler(request):
+            return httpx.Response(200, stream=LargeStream())
+        with patch("app.collector.resolve_public_url", self.resolver), \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+             patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+            with self.assertRaisesRegex(ValueError, "2 MB"):
+                await fetch_public("https://example.com/feed")
+        self.assertEqual(routes, [None])
+        sleep.assert_not_awaited()
+
+    async def test_redirect_dns_is_validated_after_a_retry(self):
+        requests, routes = [], []
+        def handler(request):
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ConnectError("unreachable", request=request)
+            return httpx.Response(302, headers={"location": "https://other.example/feed"})
+        public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443))]
+        private = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 443))]
+        loop = asyncio.get_running_loop()
+        with patch.object(loop, "getaddrinfo", AsyncMock(side_effect=[public, public, private])) as dns, \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+             patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+            with self.assertRaisesRegex(ValueError, "非公网"):
+                await fetch_public("https://example.com/feed")
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(dns.await_args_list[-1].args[0], "other.example")
+        sleep.assert_awaited_once()
+
+    async def test_redirect_limit_is_shared_across_retries(self):
+        requests, routes = [], []
+        def handler(request):
+            requests.append(request)
+            if len(requests) == 4:
+                raise httpx.ConnectError("unreachable", request=request)
+            return httpx.Response(302, headers={"location": "/next"})
+        with patch("app.collector.resolve_public_url", self.resolver), \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+             patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+            with self.assertRaisesRegex(ValueError, "跳转次数"):
+                await fetch_public("https://example.com/feed")
+        self.assertEqual(len(requests), 7)
+        sleep.assert_awaited_once()
+
+    async def test_attempt_timeout_recovers(self):
+        routes = []
+        calls = 0
+        async def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await asyncio.Event().wait()
+            return httpx.Response(200, content=RSS)
+        with patch("app.collector.resolve_public_url", self.resolver), \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+             patch("app.collector.FETCH_ATTEMPT_TIMEOUT", 0.02), \
+             patch("app.collector.asyncio.sleep", AsyncMock()):
+            data, _ = await fetch_public("https://example.com/feed")
+        self.assertEqual(data, RSS)
+        self.assertEqual(calls, 2)
+
+    async def test_total_budget_bounds_all_retries(self):
+        routes = []
+        calls = 0
+        async def handler(request):
+            nonlocal calls
+            calls += 1
+            await asyncio.Event().wait()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with patch("app.collector.resolve_public_url", self.resolver), \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+             patch("app.collector.FETCH_ATTEMPT_TIMEOUT", 0.03), patch("app.collector.FETCH_BUDGET", 0.08), \
+             patch("app.collector.retry_delay", return_value=0), \
+             patch("app.collector.asyncio.sleep", AsyncMock()):
+            with self.assertRaises(TimeoutError):
+                await fetch_public("https://example.com/feed")
+        self.assertLess(loop.time() - started, 0.4)
+        self.assertGreaterEqual(calls, 2)
+        self.assertLessEqual(calls, 3)
+
+    async def test_cancellation_interrupts_request_without_retry(self):
+        routes = []
+        entered = asyncio.Event()
+        async def handler(request):
+            entered.set()
+            await asyncio.Event().wait()
+        with patch("app.collector.resolve_public_url", self.resolver), \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+             patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+            task = asyncio.create_task(fetch_public("https://example.com/feed"))
+            await entered.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(routes, [None])
+        sleep.assert_not_awaited()
+
+    async def test_cancellation_interrupts_backoff(self):
+        routes = []
+        entered = asyncio.Event()
+        def handler(request):
+            raise httpx.ConnectError("unreachable", request=request)
+        async def backoff(delay):
+            entered.set()
+            await asyncio.Event().wait()
+        with patch("app.collector.resolve_public_url", self.resolver), \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, routes)), \
+             patch("app.collector.asyncio.sleep", backoff):
+            task = asyncio.create_task(fetch_public("https://example.com/feed"))
+            await entered.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(routes, [None])
+
+    async def test_dns_only_temporary_errors_retry(self):
+        loop = asyncio.get_running_loop()
+        public = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443))]
+        def handler(request):
+            return httpx.Response(200, content=RSS)
+        with patch.object(loop, "getaddrinfo", AsyncMock(side_effect=[socket.gaierror(socket.EAI_AGAIN, "temporary"), public])), \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, [])), \
+             patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+            await fetch_public("https://example.com/feed")
+        sleep.assert_awaited_once()
+        with patch.object(loop, "getaddrinfo", AsyncMock(side_effect=socket.gaierror(socket.EAI_NONAME, "unknown hostname"))) as dns, \
+             patch("app.collector.httpx.AsyncClient", self.client_factory(handler, [])), \
+             patch("app.collector.asyncio.sleep", AsyncMock()) as sleep:
+            with self.assertRaises(socket.gaierror):
+                await fetch_public("https://example.com/feed")
+        self.assertEqual(dns.await_count, 1)
+        sleep.assert_not_awaited()
+
+    def test_proxy_config_and_errors_do_not_expose_credentials(self):
+        secret = "credentials-must-stay-private"
+        for proxy in (f"socks5://user:{secret}@proxy.example:1080", f"http://user:{secret}@proxy.example:70000"):
+            with self.subTest(proxy=proxy), patch.dict(os.environ, {"NEWSROOM_FETCH_MODE": "proxy", "NEWSROOM_OUTBOUND_PROXY": proxy}):
+                with self.assertRaises(ValueError) as error:
+                    fetch_config()
+                self.assertNotIn(secret, str(error.exception))
+                self.assertNotIn("proxy.example", safe_error(error.exception))
+        self.assertNotIn(secret, safe_error(httpx.ProxyError(f"proxy failed: http://user:{secret}@proxy.example")))
+
+    def test_invalid_fetch_config_is_rejected_before_database_initialization(self):
+        cases = [("unsupported", "", "NEWSROOM_FETCH_MODE"), ("proxy", "", "NEWSROOM_OUTBOUND_PROXY")]
+        for mode, proxy, expected in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory, \
+                 patch.dict(os.environ, {"NEWSROOM_FETCH_MODE": mode, "NEWSROOM_OUTBOUND_PROXY": proxy}), \
+                 patch("app.main.Database.initialize") as initialize:
+                with self.assertRaisesRegex(ValueError, expected):
+                    create_app(directory, start_scheduler=False)
+                initialize.assert_not_called()
+                self.assertFalse((Path(directory) / "newsroom.sqlite3").exists())
 
 
 class CollectorTests(unittest.IsolatedAsyncioTestCase):
@@ -248,6 +601,25 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((run["status"], run["new_count"], run["source_count"]), ("partial", 2, 2))
             self.assertIn("Broken", run["error"])
             self.assertIsNotNone(conn.execute("SELECT last_error FROM sources WHERE name='Broken'").fetchone()[0])
+
+    async def test_invalid_xml_is_not_fetched_again(self):
+        requests = []
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, content=b"<rss><channel>")
+        real_client = httpx.AsyncClient
+        resolver = AsyncMock(return_value=("https://example.com/feed", "https://1.1.1.1:443/feed", "example.com", "example.com"))
+        collector = Collector(self.db)
+        with patch.dict(os.environ, {"NEWSROOM_FETCH_MODE": "direct"}), \
+             patch("app.collector.resolve_public_url", resolver), \
+             patch("app.collector.httpx.AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), trust_env=False)):
+            await collector.start(["games"])
+            await collector.task
+        self.assertEqual(len(requests), 1)
+        with self.db.connection() as conn:
+            run = conn.execute("SELECT status,error FROM runs").fetchone()
+            self.assertEqual(run["status"], "failed")
+            self.assertIn("来源 XML 格式无效", run["error"])
 
     async def test_schedule_claim_persists_after_restart(self):
         schedule_id = add_schedule(self.db)
