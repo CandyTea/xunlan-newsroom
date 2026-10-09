@@ -99,7 +99,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await scheduler.stop()
         await collector.stop()
 
-    app = FastAPI(title="Newsroom", version="1.1.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.1.1", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector

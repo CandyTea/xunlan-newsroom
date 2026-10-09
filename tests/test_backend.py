@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 
 from app.catalog import article_topics, load_catalog
 from app.collector import Collector, canonical_url, fetch_public, matches_watch, parse_rss, parse_steam, rematch_watch, resolve_public_url
-from app.db import Database
+from app.db import Database, load_default_sources
 from app.main import ADMIN_COOKIE_NAME, COOKIE_NAME, create_app, password_hash, token_hash
 from app.models import Source, public_url_syntax
 from app.scheduler import due_slots, next_run, slots_between
@@ -65,6 +65,51 @@ class ParsingTests(unittest.TestCase):
                          {"team:golden-state-warriors", "league:nba"})
         self.assertEqual(article_topics({"title": "Golden State Warriors movie", "summary": "", "category": "games"}, catalog), set())
         self.assertEqual(article_topics({"title": "NBA2K update and EPLANE", "summary": "", "category": "sports"}, catalog), set())
+
+    def test_team_short_names_are_explicit_and_have_word_boundaries(self):
+        catalog = load_catalog()
+        for title, team_id, league_id in [("WARRIORS win", "golden-state-warriors", "nba"),
+                                          ("Lakers trade update", "los-angeles-lakers", "nba"),
+                                          ("Barça win", "fc-barcelona", "la-liga")]:
+            with self.subTest(title=title):
+                self.assertEqual(article_topics({"title": title, "summary": "", "category": "sports"}, catalog),
+                                 {"team:" + team_id, "league:" + league_id})
+        for title in ("Warriors2 update", "Spurs prepare for a fixture", "Heat and thunder delay a match",
+                      "City and United meet", "Fishing nets and rockets"):
+            with self.subTest(title=title):
+                self.assertEqual(article_topics({"title": title, "summary": "", "category": "sports"}, catalog), set())
+
+    def test_team_watch_expands_exact_names_and_preserves_constraints(self):
+        catalog = load_catalog()
+        watch = {"type": "team", "enabled": True, "name": "勇士", "aliases": [], "ticker": "",
+                 "league_id": "nba", "keywords": ["playoffs"], "exclude_keywords": ["rumor"]}
+        article = {"title": "Warriors win", "summary": "playoffs", "category": "sports"}
+        self.assertTrue(matches_watch(article, watch, catalog))
+        self.assertTrue(matches_watch(article, {**watch, "name": "Favorites", "aliases": ["勇士"]}, catalog))
+        self.assertTrue(matches_watch(article, {**watch, "league_id": ""}, catalog))
+        self.assertFalse(matches_watch({**article, "summary": "regular season"}, watch, catalog))
+        self.assertFalse(matches_watch({**article, "summary": "playoffs rumor"}, watch, catalog))
+        self.assertFalse(matches_watch(article, {**watch, "enabled": False}, catalog))
+        self.assertFalse(matches_watch({**article, "category": "games"}, watch, catalog))
+        self.assertFalse(matches_watch({**article, "category": "games"}, {**watch, "league_id": ""}, catalog))
+        self.assertFalse(matches_watch(article, {**watch, "league_id": "premier-league"}, catalog))
+        self.assertFalse(matches_watch(article, {**watch, "type": "company", "league_id": ""}, catalog))
+        self.assertFalse(matches_watch(article, {**watch, "name": "勇士球迷"}, catalog))
+        self.assertFalse(matches_watch(article, {**watch, "name": "NBA", "keywords": []}, catalog))
+        self.assertFalse(matches_watch(article, {**watch, "name": "Favorites", "aliases": [], "keywords": ["勇士"]}, catalog))
+        self.assertTrue(matches_watch({**article, "title": "Harbour Falcons win"},
+                                      {**watch, "name": "Harbour Falcons"}, catalog))
+
+    def test_ambiguous_catalog_alias_does_not_expand_without_a_league(self):
+        catalog = load_catalog()
+        catalog["teams"].append({"id": "other-warriors", "name": "Other Warriors", "aliases": ["Warriors"],
+                                 "league_id": "premier-league"})
+        watch = {"type": "team", "enabled": True, "name": " warriors ", "aliases": [], "ticker": "",
+                 "league_id": "", "keywords": [], "exclude_keywords": []}
+        article = {"title": "金州勇士赢球", "summary": "", "category": "sports"}
+        self.assertFalse(matches_watch(article, watch, catalog))
+        self.assertTrue(matches_watch(article, {**watch, "league_id": "nba"}, catalog))
+
     def test_rss_strips_html_and_preserves_dates(self):
         items = parse_rss(RSS, "https://example.com/feed")
         self.assertEqual(len(items), 2)
@@ -543,8 +588,115 @@ class APITests(unittest.TestCase):
         self.assertEqual(custom.status_code, 200)
         self.assertEqual(self.client.get(f"/api/articles?watch_id={custom.json()['id']}").json()["total"], 4)
 
+    def test_chinese_team_watch_matches_existing_and_new_english_news(self):
+        source = add_source(self.db, category="sports")
+        item = {"title": "Warriors win", "summary": "playoffs", "canonical_url": "https://example.com/existing-warriors",
+                "url": "https://example.com/existing-warriors", "published_at": None, "image_url": None}
+        self.app.state.collector.persist_articles(source, [item])
+        watch = {"type": "team", "name": "勇士", "keywords": ["playoffs"], "exclude_keywords": ["rumor"]}
+        response = self.client.post("/api/watches", json=watch, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        watch_id = response.json()["id"]
+        self.assertEqual(response.json()["aliases"], [])
+        self.assertEqual(self.client.get(f"/api/articles?watch_id={watch_id}").json()["total"], 1)
+        self.app.state.collector.persist_articles(source, [
+            {**item, "title": "Golden State Warriors win again", "canonical_url": "https://example.com/new-warriors", "url": "https://example.com/new-warriors"},
+            {**item, "summary": "playoffs rumor", "canonical_url": "https://example.com/warriors-rumor", "url": "https://example.com/warriors-rumor"},
+            {**item, "summary": "regular season", "canonical_url": "https://example.com/warriors-context", "url": "https://example.com/warriors-context"}])
+        game_source = add_source(self.db, category="games")
+        self.app.state.collector.persist_articles(game_source, [
+            {**item, "canonical_url": "https://example.com/warriors-game", "url": "https://example.com/warriors-game"}])
+        self.assertEqual(self.client.get(f"/api/articles?watch_id={watch_id}").json()["total"], 2)
+        self.client.put(f"/api/watches/{watch_id}", json=watch, headers=self.headers)
+        self.assertEqual(self.client.get(f"/api/articles?watch_id={watch_id}").json()["total"], 2)
+
 
 class MigrationTests(unittest.TestCase):
+    def test_default_source_ids_are_validated(self):
+        source = {"name": "New feed", "url": "https://example.com/feed", "category": "sports"}
+        for entries in ([{**source, "seed_id": "bad key"}],
+                        [{**source, "seed_id": "same"}, {**source, "seed_id": "same"}]):
+            with self.subTest(entries=entries), patch("app.db.Path.read_text", return_value=json.dumps(entries)):
+                with self.assertRaisesRegex(ValueError, "seed_id"):
+                    load_default_sources()
+
+    def test_default_source_upgrade_is_once_and_preserves_user_choices(self):
+        defaults = [
+            (None, Source(name="Old deleted", url="https://example.com/old-deleted", category="sports").model_dump()),
+            (None, Source(name="Old disabled", url="https://example.com/old-disabled", category="sports").model_dump()),
+            ("new-one", Source(name="New one", url="https://example.com/new-one", category="sports").model_dump()),
+            ("new-two", Source(name="New two", url="https://example.com/new-two", category="sports").model_dump())]
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            with patch("app.db.load_default_sources", return_value=defaults[:2]):
+                db.initialize()
+            with db.connection(write=True) as conn:
+                conn.execute("DELETE FROM sources WHERE name='Old deleted'")
+                conn.execute("UPDATE sources SET name='User renamed',enabled=0,last_success_at='previous',last_error='kept' WHERE name='Old disabled'")
+                conn.execute("INSERT INTO sources(name,kind,url,category,enabled) VALUES('My feed','rss','https://example.com/new-two','games',0)")
+            with patch("app.db.load_default_sources", return_value=defaults):
+                db.initialize()
+                db.initialize()
+                with db.connection() as conn:
+                    rows = {row["url"]: dict(row) for row in conn.execute("SELECT * FROM sources")}
+                    self.assertEqual(set(rows), {"https://example.com/old-disabled", "https://example.com/new-one", "https://example.com/new-two"})
+                    old = rows["https://example.com/old-disabled"]
+                    self.assertEqual((old["name"], old["enabled"], old["last_success_at"], old["last_error"]),
+                                     ("User renamed", 0, "previous", "kept"))
+                    duplicate = rows["https://example.com/new-two"]
+                    self.assertEqual((duplicate["name"], duplicate["category"], duplicate["enabled"]), ("My feed", "games", 0))
+                    self.assertEqual(rows["https://example.com/new-one"]["enabled"], 1)
+                with db.connection(write=True) as conn:
+                    conn.execute("UPDATE sources SET enabled=0 WHERE url='https://example.com/new-one'")
+                    conn.execute("DELETE FROM sources WHERE url='https://example.com/new-two'")
+                db.initialize()
+                with db.connection() as conn:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0], 2)
+                    self.assertEqual(conn.execute("SELECT enabled FROM sources WHERE url='https://example.com/new-one'").fetchone()[0], 0)
+            extra = ("new-three", Source(name="New three", url="https://example.com/new-three", category="sports").model_dump())
+            with patch("app.db.load_default_sources", return_value=[*defaults, extra]):
+                db.initialize()
+                db.initialize()
+            with db.connection() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0], 3)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM sources WHERE url='https://example.com/new-two'").fetchone()[0], 0)
+                self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_fresh_install_records_upgrades_before_user_deletes_a_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.sqlite3")
+            db.initialize()
+            defaults = load_default_sources()
+            with db.connection(write=True) as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0], len(defaults))
+                for seed_id, _ in defaults:
+                    if seed_id:
+                        self.assertIsNotNone(conn.execute("SELECT 1 FROM metadata WHERE key=?", ("default_source:" + seed_id,)).fetchone())
+                conn.execute("DELETE FROM sources")
+            db.initialize()
+            with db.connection() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0], 0)
+
+    def test_matching_rule_upgrade_rematches_existing_team_watches_with_same_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = empty_db(directory)
+            source = add_source(db, category="sports")
+            item = {"title": "Warriors win", "summary": "playoffs", "canonical_url": "https://example.com/old-warriors",
+                    "url": "https://example.com/old-warriors", "published_at": None, "image_url": None}
+            Collector(db).persist_articles(source, [item])
+            with db.connection(write=True) as conn:
+                watch_id = conn.execute("INSERT INTO watches(type,name,aliases,keywords,exclude_keywords,enabled,market,ticker) VALUES('team','勇士','[]','[\"playoffs\"]','[\"rumor\"]',1,'','')").lastrowid
+                conn.execute("UPDATE articles SET saved=1,read=1")
+                version = conn.execute("SELECT value FROM metadata WHERE key='topic_index_version'").fetchone()[0]
+                conn.execute("UPDATE metadata SET value=? WHERE key='topic_index_version'", (version.replace("sports-v2:", "sports-v1:"),))
+            db.initialize()
+            db.initialize()
+            with db.connection() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM article_watches WHERE watch_id=?", (watch_id,)).fetchone()[0], 1)
+                self.assertEqual(tuple(conn.execute("SELECT saved,read FROM articles").fetchone()), (1, 1))
+                self.assertEqual(tuple(conn.execute("SELECT name,aliases,keywords,exclude_keywords FROM watches WHERE id=?", (watch_id,)).fetchone()),
+                                 ("勇士", "[]", '["playoffs"]', '["rumor"]'))
+
     def test_old_database_preserves_user_article_watch_schedule_and_reindexes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "newsroom.sqlite3"
@@ -579,6 +731,8 @@ class MigrationTests(unittest.TestCase):
             app.state.db.initialize()
             with app.state.db.connection() as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM article_topics").fetchone()[0], 2)
+                self.assertEqual({row[0] for row in conn.execute("SELECT url FROM sources")},
+                                 {source["url"] for seed_id, source in load_default_sources() if seed_id})
                 self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_catalog_change_reindexes_historical_articles(self):
@@ -590,15 +744,18 @@ class MigrationTests(unittest.TestCase):
             collector.persist_articles(source, [item])
             with db.connection(write=True) as conn:
                 watch_id = conn.execute("INSERT INTO watches(type,name,aliases,keywords,exclude_keywords,enabled,market,ticker,league_id) VALUES('league','NBA','[]','[]','[]',1,'','','nba')").lastrowid
+                team_watch_id = conn.execute("INSERT INTO watches(type,name,aliases,keywords,exclude_keywords,enabled,market,ticker,league_id) VALUES('team','新俱乐部','[]','[]','[]',1,'','','nba')").lastrowid
                 rematch_watch(conn, watch_id, db.catalog)
+                rematch_watch(conn, team_watch_id, db.catalog)
             with db.connection() as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM article_topics").fetchone()[0], 0)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM article_watches").fetchone()[0], 0)
-            db.catalog["teams"].append({"id": "new-club", "name": "New Club", "aliases": [], "league_id": "nba"})
+            db.catalog["teams"].append({"id": "new-club", "name": "新俱乐部", "aliases": ["New Club"], "league_id": "nba"})
             db.initialize()
             with db.connection() as conn:
                 self.assertEqual({row[0] for row in conn.execute("SELECT topic_id FROM article_topics")}, {"team:new-club", "league:nba"})
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM article_watches WHERE watch_id=?", (watch_id,)).fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM article_watches WHERE watch_id=?", (team_watch_id,)).fetchone()[0], 1)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,17 @@ def term_matches(text, term):
     return re.search(escaped, text, re.I) is not None
 
 
+def watch_team(watch, catalog):
+    if watch.get("type") != "team" or catalog is None:
+        return None
+    names = {name.strip().casefold() for name in [watch["name"], *watch["aliases"]]}
+    league_id = watch.get("league_id", "")
+    teams = [team for team in catalog["teams"]
+             if (not league_id or team["league_id"] == league_id)
+             and names.intersection(name.strip().casefold() for name in [team["name"], *team.get("aliases", [])])]
+    return teams[0] if len(teams) == 1 else None
+
+
 def article_topics(article, catalog):
     if article["category"] != "sports":
         return set()
@@ -54,7 +65,7 @@ def article_topics(article, catalog):
 
 def reindex_topics(conn, catalog):
     fingerprint = hashlib.sha256(json.dumps(catalog, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-    version = "sports-v1:" + fingerprint
+    version = "sports-v2:" + fingerprint
     old = conn.execute("SELECT value FROM metadata WHERE key='topic_index_version'").fetchone()
     if old and old[0] == version:
         return False

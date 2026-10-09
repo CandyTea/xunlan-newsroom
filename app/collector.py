@@ -15,7 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 
-from .catalog import article_topics, term_matches
+from .catalog import article_topics, term_matches, watch_team
 from .db import utc_now
 from .models import public_url_syntax
 
@@ -92,9 +92,12 @@ def matches_watch(article, watch, catalog=None):
     if any(term_matches(text, term) for term in watch["exclude_keywords"]):
         return False
     league_id = watch.get("league_id", "")
-    if league_id and article.get("category") != "sports":
+    if (league_id or watch.get("type") == "team") and article.get("category") != "sports":
         return False
     names = [watch["name"], watch["ticker"], *watch["aliases"]]
+    team = watch_team(watch, catalog)
+    if team:
+        names.extend([team["name"], *team.get("aliases", [])])
     if watch.get("type") == "league" and league_id:
         if catalog is None:
             raise ValueError("预设联赛匹配需要已加载的兴趣目录")

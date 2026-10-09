@@ -1,4 +1,4 @@
-# 讯览（Newsroom）v1.1
+# 讯览（Newsroom）v1.1.1
 
 讯览是一款单用户、自托管的新闻阅读器。它按游戏、体育、股票和国际新闻分类汇总来源，支持关注词条、收藏、已读状态与定时抓取。视觉方向以财新现有识别度为灵感。
 
@@ -14,12 +14,12 @@
 
 ## 已配置来源
 
-初始配置含 11 个已启用 RSS 来源和 2 个默认关闭的 Steam 新闻示例。来源覆盖会随网站 RSS 内容变化。来源的增删、停用和错误查看在 `/admin` 管理入口中进行。
+初始配置含 15 个已启用 RSS 来源和 2 个默认关闭的 Steam 新闻示例。来源覆盖会随网站 RSS 内容变化。来源的增删、停用和错误查看在 `/admin` 管理入口中进行。
 
 | 分类 | 已启用来源 |
 | --- | --- |
 | 游戏 | [游研社](https://www.yystv.cn/rss/feed)、[机核](https://www.gcores.com/rss) |
-| 体育 | [中新网体育](https://www.chinanews.com.cn/rss/sports.xml)、[BBC 体育](https://feeds.bbci.co.uk/sport/rss.xml)、[ESPN](https://www.espn.com/espn/rss/news) |
+| 体育 | [中新网体育](https://www.chinanews.com.cn/rss/sports.xml)、[BBC 体育](https://feeds.bbci.co.uk/sport/rss.xml)、[ESPN](https://www.espn.com/espn/rss/news)、[ESPN NBA](https://www.espn.com/espn/rss/nba/news)、[BBC 足球](https://feeds.bbci.co.uk/sport/football/rss.xml)、[The Guardian 英超](https://www.theguardian.com/football/premierleague/rss)、[The Guardian 皇家马德里](https://www.theguardian.com/football/realmadrid/rss) |
 | 股票 | [中新网财经](https://www.chinanews.com.cn/rss/finance.xml)、[FT 中文网](https://www.ftchinese.com/rss/feed)、[The Guardian 财经](https://www.theguardian.com/business/rss) |
 | 政治 | [中新网国际](https://www.chinanews.com.cn/rss/world.xml)、[BBC 国际](https://feeds.bbci.co.uk/news/world/rss.xml)、[The Guardian 国际](https://www.theguardian.com/world/rss) |
 
@@ -41,6 +41,8 @@ Steam 环世界（App ID `294100`）和只狼（App ID `814380`）是可选示�
 体育关注支持先选联赛、再选球队，可关注联赛或单支球队。内置 29 支常见球队：NBA 12 支、英超 8 支、西甲 9 支，包含金州勇士、皇家马德里和巴塞罗那。它们是起步目录，不是联赛完整名册，也不会随赛季自动更新。目录参考：[NBA 球队](https://www.nba.com/teams)、[英超俱乐部](https://www.premierleague.com/en/clubs)、[LaLiga 俱乐部](https://www.laliga.com/en-EG/laliga-easports/clubs)。
 
 预置联赛关注也会包含已关联球队的文章，即使文章没有提到联赛名称。你可以添加自定义联赛或球队；自定义球队可独立关注，也可选填一个预置联赛。未绑定预置联赛的自定义联赛按自身名称和别名匹配。联赛和球队识别只检查已收取文章的标题与来源摘要，不提供实时比分或赛果。
+
+内置球队关注会自动识别目录中的中文名、英文名及已收录的简称，例如“勇士”可匹配 `Golden State Warriors` 和 `Warriors`，无需自行补填英文别名。更新目录时，已有球队与联赛关注会重新匹配历史文章。自定义球队仍按你填写的名称与别名识别；上下文关键词和排除词继续生效。
 
 ## 阅读者与管理入口
 
@@ -176,7 +178,7 @@ sudo docker compose -f compose.yaml -f deploy/compose.caddy.yaml logs -f caddy
 
 ## 升级、停止与备份
 
-升级前先按下方步骤备份当前 SQLite 数据目录。v1.1 启动时会自动迁移现有数据库，保留账户、文章、已读/收藏状态、关注对象和收取计划；无需删除数据库或重新创建账户。
+升级前先按下方步骤备份当前 SQLite 数据目录。v1.1.1 启动时会自动迁移现有数据库，保留账户、文章、已读/收藏状态、关注对象和收取计划；无需删除数据库或重新创建账户。旧安装会一次性补入本次新增的四个体育专项来源，已有同地址来源的名称与启用状态保持不变。补入后自行删除的来源不会因重启而恢复。更新完成后点击“收取资讯”，或等待包含体育分类的下一次计划。
 
 GitHub 安装的更新命令：
 
@@ -229,5 +231,11 @@ sudo docker compose ps
 sudo docker compose logs -f app
 sudo docker compose restart app
 ```
+
+### 球队没有资讯时
+
+先确认收取计划包含“体育”，或手动点击“收取资讯”。球队筛选与关注只整理已收取到的文章，综合体育来源没有相应球队报道时，列表会为空。
+
+若更新至 v1.1.1 并再次收取后仍为空，进入独立的 `/admin` 页面，用现有账号密码再次验证，查看体育来源的最近成功时间和错误信息。“来源请求超时”或“无法连接来源”表示服务器未能取得这些报道；添加英文别名无法解决连接问题。本地能连通某个来源，也不代表腾讯云服务器能连通。如果服务器需要代理出口，按上文配置 `NEWSROOM_OUTBOUND_PROXY`，然后重新创建容器以应用环境变量。
 
 Docker 官方 Compose 插件文档：[Linux 安装指南](https://docs.docker.com/compose/install/linux/)。腾讯云 OpenCloudOS 9.0 Docker 步骤：[搭建 Docker](https://cloud.tencent.com/document/product/213/46000)。

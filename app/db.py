@@ -1,5 +1,6 @@
 """Small SQLite store. Each operation owns its connection and transaction."""
 import json
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -14,6 +15,46 @@ def utc_now():
 
 
 DEFAULT_SETTINGS = {"timezone": "Asia/Shanghai", "catch_up": True, "catch_up_hours": 4}
+
+
+def load_default_sources():
+    from .models import Source
+    path = Path(__file__).with_name("default_sources.json")
+    if not path.exists():
+        return []
+    defaults = []
+    seed_ids = set()
+    for entry in json.loads(path.read_text(encoding="utf-8")):
+        entry = dict(entry)
+        seed_id = entry.pop("seed_id", None)
+        if seed_id is not None:
+            if (not isinstance(seed_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,79}", seed_id)
+                    or seed_id in seed_ids):
+                raise ValueError("默认来源 seed_id 必须有效且唯一")
+            seed_ids.add(seed_id)
+        defaults.append((seed_id, Source(**entry).model_dump()))
+    return defaults
+
+
+def seed_default_sources(conn):
+    seeded = conn.execute("SELECT 1 FROM metadata WHERE key='sources_seeded'").fetchone()
+    for seed_id, source in load_default_sources():
+        # Legacy defaults are only seeded on a fresh install. Stable IDs opt
+        # new additions into a one-time upgrade, even if later deleted.
+        if seeded and seed_id is None:
+            continue
+        key = "default_source:" + seed_id if seed_id else None
+        if key and conn.execute("SELECT 1 FROM metadata WHERE key=?", (key,)).fetchone():
+            continue
+        exists = conn.execute("SELECT 1 FROM sources WHERE kind=? AND url=?",
+                              (source["kind"], source["url"])).fetchone()
+        if not exists:
+            conn.execute("INSERT INTO sources(name,kind,url,category,enabled,steam_appid) VALUES(?,?,?,?,?,?)",
+                         (source["name"], source["kind"], source["url"], source["category"],
+                          int(source["enabled"]), source["steam_appid"]))
+        if key:
+            conn.execute("INSERT INTO metadata(key,value) VALUES(?,'1')", (key,))
+    conn.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('sources_seeded','1')")
 
 
 class Database:
@@ -103,22 +144,12 @@ class Database:
             conn.execute("INSERT OR IGNORE INTO settings(id,value) VALUES(1,?)", (json.dumps(DEFAULT_SETTINGS),))
             conn.execute("UPDATE runs SET status='interrupted',finished_at=?,error=? WHERE status='running'",
                          (utc_now(), "服务重启中断了此次采集；已保存的文章仍然保留"))
-            seeded = conn.execute("SELECT 1 FROM metadata WHERE key='sources_seeded'").fetchone()
-            if not seeded:
-                seed = Path(__file__).with_name("default_sources.json")
-                if seed.exists():
-                    from .models import Source
-                    for source in json.loads(seed.read_text(encoding="utf-8")):
-                        source = Source(**source).model_dump()
-                        conn.execute("INSERT INTO sources(name,kind,url,category,enabled,steam_appid) VALUES(?,?,?,?,?,?)",
-                                     (source["name"], source.get("kind", "rss"), source["url"], source["category"],
-                                      int(source.get("enabled", True)), source.get("steam_appid")))
-                conn.execute("INSERT INTO metadata(key,value) VALUES('sources_seeded','1')")
+            seed_default_sources(conn)
             conn.execute("DELETE FROM admin_grants WHERE expires_at<=?", (utc_now(),))
             conn.execute("DELETE FROM sessions WHERE expires_at<=?", (utc_now(),))
             if reindex_topics(conn, self.catalog):
                 from .collector import rematch_watch
-                for watch in conn.execute("SELECT id FROM watches WHERE type='league' AND league_id<>''"):
+                for watch in conn.execute("SELECT id FROM watches WHERE type IN ('team','league')"):
                     rematch_watch(conn, watch["id"], self.catalog)
             conn.commit()
 
