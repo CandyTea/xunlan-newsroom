@@ -19,9 +19,10 @@ from fastapi.staticfiles import StaticFiles
 
 from .collector import Collector, fetch_config, fetch_public, rematch_watch, resolve_public_url, watch_from_row
 from .browser import browser_cache_url, browser_source_urls, parse_browser_feed
+from .content import ArticleReader, ContentError
 from .db import Database, utc_now
 from .dns import dns_mode
-from .models import ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, Schedule, Settings, Setup, Source, TranslationRequest, TranslationSettings, Watch
+from .models import ArticleHtml, ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, Schedule, Settings, Setup, Source, TranslationRequest, TranslationSettings, Watch
 from .scheduler import Scheduler, next_run, schedule_from_row
 from .translation import PROVIDERS, TranslationError, Translator, needs_translation
 
@@ -62,6 +63,8 @@ class BodyLimitMiddleware:
             return
         data = bytearray()
         limit = 4 * 1024 * 1024 if scope["path"] == "/api/browser/import" and scope["method"] == "POST" else 64 * 1024
+        if scope["path"].startswith("/api/articles/") and scope["path"].endswith("/content/import") and scope["method"] == "POST":
+            limit = 4 * 1024 * 1024
         if scope["path"] == "/api/translation/settings" and scope["method"] == "PUT":
             limit = 256 * 1024
         while True:
@@ -92,6 +95,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
     db.initialize()
     collector = Collector(db, fetcher)
     translator = Translator(db)
+    reader = ArticleReader(db)
     browser_urls = browser_source_urls()
     scheduler = Scheduler(db, collector)
     setup_token = os.getenv("SETUP_TOKEN", "")
@@ -109,8 +113,9 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await scheduler.stop()
         await collector.stop()
         await translator.stop()
+        await reader.stop()
 
-    app = FastAPI(title="Newsroom", version="1.2.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.3.0", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -122,7 +127,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; connect-src 'self' https://raw.githubusercontent.com https://www.espn.com https://api.rss2json.com https://api.allorigins.win; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; connect-src 'self' https://raw.githubusercontent.com https://www.espn.com https://api.rss2json.com https://api.allorigins.win https://r.jina.ai; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         if request.url.path.startswith("/api/") or request.url.path in ("/", "/admin"):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -136,6 +141,10 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
     @app.exception_handler(TranslationError)
     async def translation_error(request, exc):
         return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=exc.status)
+
+    @app.exception_handler(ContentError)
+    async def content_error(request, exc):
+        return JSONResponse({"detail": str(exc), "code": "content_unavailable"}, status_code=502)
 
     def existing_session(request):
         token = request.cookies.get(COOKIE_NAME, "")
@@ -411,12 +420,39 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
     @app.get("/api/articles/{article_id}", dependencies=[Depends(require_auth)])
     def article(article_id: int):
         with db.connection() as conn:
-            return article_from_row(conn, ensure_row(conn, "articles", article_id))
+            value = article_from_row(conn, ensure_row(conn, "articles", article_id))
+            value.update(content_result(conn, value))
+            return value
+
+    def content_result(conn, value):
+        content = reader.cached(conn, value)
+        return {"content": content, "body_translation": translator.cached_body(conn, value, content["paragraphs"]) if content else None}
+
+    @app.post("/api/articles/{article_id}/content", dependencies=[Depends(require_auth)])
+    async def article_content(article_id: int):
+        with db.connection() as conn:
+            value = dict(ensure_row(conn, "articles", article_id))
+        await reader.read(value)
+        with db.connection() as conn:
+            return content_result(conn, value)
+
+    @app.post("/api/articles/{article_id}/content/import", dependencies=[Depends(require_auth)])
+    async def import_article_content(article_id: int, body: ArticleHtml):
+        with db.connection() as conn:
+            value = dict(ensure_row(conn, "articles", article_id))
+        await reader.import_html(value, body.article_url, body.html)
+        with db.connection() as conn:
+            return content_result(conn, value)
 
     @app.post("/api/articles/{article_id}/translate", dependencies=[Depends(require_auth)])
     async def translate_article(article_id: int, body: TranslationRequest):
         with db.connection() as conn:
             value = dict(ensure_row(conn, "articles", article_id))
+            content = reader.cached(conn, value) if body.scope == "body" else None
+        if body.scope == "body":
+            if content is None:
+                raise HTTPException(409, "请先载入新闻正文，再点击翻译。")
+            return {"translation": await translator.translate_body(value, content["paragraphs"])}
         return {"translation": await translator.translate(value, automatic=body.automatic)}
 
     @app.patch("/api/articles/{article_id}", dependencies=[Depends(require_auth)])

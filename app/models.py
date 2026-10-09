@@ -207,6 +207,23 @@ class TranslationSettings(StrictModel):
 
 class TranslationRequest(StrictModel):
     automatic: bool = False
+    scope: Literal["summary", "body"] = "summary"
+
+    @model_validator(mode="after")
+    def manual_body_only(self):
+        if self.automatic and self.scope == "body":
+            raise ValueError("正文只能手动翻译")
+        return self
+
+
+class ArticleHtml(StrictModel):
+    article_url: str = Field(min_length=1, max_length=2048)
+    html: str = Field(min_length=1, max_length=2 * 1024 * 1024)
+
+    @field_validator("article_url")
+    @classmethod
+    def safe_article_url(cls, value):
+        return public_url_syntax(value)
 
 
 def public_url_syntax(value):

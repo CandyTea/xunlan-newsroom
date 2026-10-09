@@ -8,10 +8,12 @@ window.BrowserNews = (() => {
     const abort = () => controller.abort();
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) controller.abort();
-    const timeout = setTimeout(abort, 15000);
+    const duration = route.timeout || 15000;
+    const timeout = setTimeout(abort, duration);
     try {
       const response = await fetch(route.url, {
         mode: "cors", credentials: "omit", referrerPolicy: "no-referrer", signal: controller.signal,
+        headers: route.headers,
       });
       if (!response.ok) throw new Error(`来源返回 HTTP ${response.status}`);
       if (Number(response.headers.get("Content-Length")) > MAX_BYTES) throw new Error("来源内容超过 2 MB");
@@ -34,6 +36,7 @@ window.BrowserNews = (() => {
         content = await response.text();
         if (new TextEncoder().encode(content).byteLength > MAX_BYTES) throw new Error("来源内容超过 2 MB");
       }
+      if (route.format === "article") return { content };
       if (route.format === "cache") {
         const data = JSON.parse(content);
         const fetchedAt = Date.parse(data.fetched_at);
@@ -52,7 +55,7 @@ window.BrowserNews = (() => {
       }
       return { content, format: route.format === "rss2json" ? "rss2json" : "rss" };
     } catch (error) {
-      if (controller.signal.aborted && !signal.aborted) throw new Error("请求超过 15 秒，已超时");
+      if (controller.signal.aborted && !signal.aborted) throw new Error(`请求超过 ${duration / 1000} 秒，已超时`);
       if (error instanceof TypeError) throw new Error("浏览器无法读取响应，可能是网络或跨域限制");
       if (error instanceof SyntaxError) throw new Error("返回内容不是有效 JSON");
       throw error;
@@ -110,5 +113,19 @@ window.BrowserNews = (() => {
     return result;
   }
 
-  return { collect };
+  async function articlePage(url, signal, reader = false) {
+    const route = reader ? {
+      url: `https://r.jina.ai/${url}`, format: "article", timeout: 25000,
+      headers: { Accept: "application/json", "X-Respond-With": "html" },
+    } : { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, format: "article" };
+    const result = await readFeed(route, signal);
+    if (!reader) return result.content;
+    const payload = JSON.parse(result.content);
+    if (payload.code !== 200 || typeof payload.data?.content !== "string" || payload.data.warning) throw new Error("正文读取服务未返回有效页面");
+    const html = payload.data.content;
+    if (!/<(?:!doctype|html|article|p)[\s>]/i.test(html)) throw new Error("正文读取服务未返回 HTML");
+    return html;
+  }
+
+  return { collect, articlePage };
 })();

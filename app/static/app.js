@@ -32,6 +32,7 @@ const main = $("#main-content");
 const modal = $("#modal");
 const deviceNews = { busy: false, lastAttempt: 0, controller: null, pending: null };
 const listTranslation = { controller: null, retryAfter: 0 };
+let articleContentController = null;
 
 function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
@@ -120,8 +121,9 @@ function empty(title, copy, actions = [], iconName = "inbox") {
 function heading(title, subtitle, actions = []) {
   return el("div", { class: "view-heading" }, [el("div", {}, [el("h1", { text: title }), el("p", { text: subtitle })]), actions.length > 0 && el("div", { class: "heading-actions" }, actions)]);
 }
-function closeModal() { state.modalId += 1; if (modal.open) modal.close(); }
+function closeModal() { articleContentController?.abort(); articleContentController = null; state.modalId += 1; if (modal.open) modal.close(); }
 function openModal(title, content, className = "") {
+  articleContentController?.abort(); articleContentController = null;
   $("#modal-title").textContent = title; $("#modal-body").replaceChildren(content); modal.className = `modal ${className}`;
   if (!modal.open) modal.showModal();
   modal.scrollTop = 0;
@@ -407,41 +409,54 @@ async function autoTranslateList(id) {
 }
 async function articleDetail(id) {
   const modalId = openModal("资讯", loading("正在打开资讯…"), "article-modal");
+  const controller = new AbortController();
+  articleContentController = controller;
+  const alive = () => !controller.signal.aborted && modal.open && state.modalId === modalId;
   try {
-    const article = await api(`/articles/${id}`); if (!modal.open || state.modalId !== modalId) return;
+    const article = await api(`/articles/${id}`, { signal: controller.signal }); if (!alive()) return;
     const sourceUrl = safeUrl(article.url);
     const title = el("h1", { text: article.title || "无标题资讯" });
     const summary = el("p", { text: article.summary || "该来源未提供摘要，请前往原文阅读。" });
     const detail = el("article", { class: "article-detail" }, [el("p", { class: "article-kicker", text: CATEGORIES[article.category] || "资讯" }), title, el("div", { class: "news-meta" }, [el("span", { text: article.source_name || "原始来源" }), el("span", { class: "meta-divider", text: "·" }), el("time", { datetime: article.published_at, text: article.published_at ? dateTime(article.published_at, { year: "numeric" }) : "发布时间未提供" })])]);
     const imageUrl = safeUrl(article.image_url); if (imageUrl) detail.append(el("img", { src: imageUrl, alt: "", referrerpolicy: "no-referrer", onerror: event => event.target.remove() }));
-    detail.append(el("section", { class: "article-summary" }, [el("h3", { text: "来源摘要" }), summary, el("div", { class: "article-source-note", text: "内容由公开来源提供。摘要可能不完整，报道全文与后续更正以原始来源为准。" })]));
+    const summarySection = el("section", { class: "article-summary" }, [el("h3", { text: "来源摘要" }), summary]);
+    const bodySection = el("section", { class: "article-body", "aria-label": "新闻正文" }, el("p", { class: "field-caption", role: "status", text: "正在载入正文…" }));
+    const sourceNote = el("p", { class: "article-source-note", text: "内容来自原始来源，后续更正以来源网站为准。" });
+    detail.append(summarySection, bodySection, sourceNote);
     if (article.watches?.length) detail.append(el("p", { class: "article-watches", text: `与你的关注相关：${article.watches.map(w => w.name).join("、")}` }));
     const save = button(article.saved ? "已收藏" : "收藏", () => patchDetail("saved", !article.saved), "button", "bookmark", { "aria-pressed": String(Boolean(article.saved)) });
     const read = button("标为未读", () => patchDetail("read", !article.read), "button", "eye");
-    const original = sourceUrl ? el("a", { href: sourceUrl, target: "_blank", rel: "noopener noreferrer", class: "button button-primary" }, ["阅读原文", icon("external")]) : el("span", { class: "field-help", text: "原文链接不可用" });
+    const original = sourceUrl ? el("a", { href: sourceUrl, target: "_blank", rel: "noopener noreferrer", class: "button" }, ["访问原站", icon("external")]) : el("span", { class: "field-help", text: "原文链接不可用" });
     const translationError = el("p", { class: "form-error translation-error", role: "alert", hidden: true });
     let showingTranslation = false;
+    const translateLabel = () => article.content ? "翻译正文" : "翻译标题与摘要";
+    const renderBody = paragraphs => bodySection.replaceChildren(...paragraphs.map(text => el("p", { text })));
     const translate = button("翻译", async () => {
       if (showingTranslation) {
         title.textContent = article.title || "无标题资讯";
         summary.textContent = article.summary || "该来源未提供摘要，请前往原文阅读。";
-        showingTranslation = false; translate.textContent = "翻译"; return;
+        if (article.content) renderBody(article.content.paragraphs);
+        showingTranslation = false; translate.textContent = translateLabel(); return;
       }
       translate.disabled = true; translate.textContent = "翻译中…"; translationError.hidden = true;
       try {
-        if (!state.settings.translation?.ready || !article.translation) {
-          const result = await api(`/articles/${id}/translate`, { method: "POST", body: { automatic: false } });
-          article.translation = result.translation;
+        const scope = article.content ? "body" : "summary";
+        const field = scope === "body" ? "body_translation" : "translation";
+        if (!state.settings.translation?.ready || !article[field]) {
+          const result = await api(`/articles/${id}/translate`, { method: "POST", body: { automatic: false, scope }, signal: controller.signal });
+          article[field] = result.translation;
         }
-        if (!modal.open || state.modalId !== modalId) return;
-        title.textContent = article.translation.title;
-        summary.textContent = article.translation.summary || "该来源未提供摘要，请前往原文阅读。";
-        showingTranslation = true; translate.textContent = "查看原文"; updateArticle(article);
+        if (!alive()) return;
+        title.textContent = article[field].title;
+        if (scope === "body") renderBody(article.body_translation.paragraphs);
+        else summary.textContent = article.translation.summary || "该来源未提供摘要，请前往原文阅读。";
+        showingTranslation = true; translate.textContent = "显示原文"; updateArticle(article);
       } catch (error) {
         if (error.status !== 401 && modal.open && state.modalId === modalId) { translationError.textContent = error.message; translationError.hidden = false; }
-      } finally { translate.disabled = false; if (!showingTranslation) translate.textContent = "翻译"; }
-    }, "button");
-    detail.append(el("div", { class: "article-actions" }, [original, article.needs_translation && translate, save, read]), translationError);
+      } finally { translate.disabled = false; if (!showingTranslation) translate.textContent = translateLabel(); }
+    }, "button button-primary", null, { disabled: true });
+    detail.insertBefore(el("div", { class: "article-actions" }, [translate, save, read, original]), summarySection);
+    detail.insertBefore(translationError, summarySection);
     $("#modal-body").replaceChildren(detail); $("#modal-title").textContent = "阅读资讯";
     function sync() { save.replaceChildren(icon("bookmark"), article.saved ? "已收藏" : "收藏"); save.setAttribute("aria-pressed", String(Boolean(article.saved))); read.replaceChildren(icon("eye"), article.read ? "标为未读" : "标为已读"); }
     async function patchDetail(key, value) {
@@ -449,9 +464,56 @@ async function articleDetail(id) {
       try { const updated = await api(`/articles/${id}`, { method: "PATCH", body: { [key]: value } }); article[key] = typeof updated[key] === "boolean" ? updated[key] : value; sync(); updateArticle(article); toast(key === "saved" ? (value ? "已加入收藏" : "已取消收藏") : (value ? "已标为已读" : "已标为未读")); }
       catch (error) { showError(error); } finally { save.disabled = false; read.disabled = false; }
     }
+    loadBody();
     if (!article.read) { try { await api(`/articles/${id}`, { method: "PATCH", body: { read: true } }); article.read = true; updateArticle(article); } catch (error) { showError(error); } }
     sync();
+    async function loadBody() {
+      if (!alive()) return;
+      translate.disabled = true;
+      bodySection.replaceChildren(el("p", { class: "field-caption", role: "status", text: "正在载入正文…" }));
+      try {
+        if (!article.content) {
+          const result = await loadArticleContent(article, controller.signal);
+          if (!result.content?.paragraphs?.length) throw new Error("来源未返回可显示的正文，当前保留摘要。");
+          article.content = result.content; article.body_translation = result.body_translation;
+        }
+        if (!alive()) return;
+        showingTranslation = false;
+        title.textContent = article.title || "无标题资讯";
+        summarySection.hidden = true;
+        renderBody(article.content.paragraphs);
+        sourceNote.textContent = [article.content.author && `作者：${article.content.author}`, "正文由来源公开页面提取，可能不完整；后续更正以来源网站为准。"].filter(Boolean).join(" · ");
+      } catch (error) {
+        if (!alive()) return;
+        summarySection.hidden = false;
+        bodySection.replaceChildren(el("div", { class: "article-unavailable" }, [el("p", { text: error.message || "暂时无法取得正文，当前显示来源摘要。" }), button("重新载入正文", loadBody, "button button-small", "refresh")]));
+      } finally { if (alive()) { translate.disabled = false; translate.textContent = translateLabel(); } }
+    }
   } catch (error) { if (error.status !== 401 && modal.open && state.modalId === modalId) $("#modal-body").replaceChildren(errorPanel(error, () => articleDetail(id))); }
+}
+
+async function loadArticleContent(article, signal) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal.addEventListener("abort", abort, { once: true });
+  if (signal.aborted) controller.abort();
+  const server = api(`/articles/${article.id}/content`, { method: "POST", body: {}, signal: controller.signal });
+  const device = (async () => {
+    let lastError;
+    for (const reader of [false, true]) {
+      if (controller.signal.aborted) throw new Error("正文读取已取消");
+      try {
+        const html = await BrowserNews.articlePage(article.url, controller.signal, reader);
+        return await api(`/articles/${article.id}/content/import`, { method: "POST", body: { article_url: article.url, html }, signal: controller.signal });
+      } catch (error) { lastError = error; if (error.status === 401 || controller.signal.aborted) throw error; }
+    }
+    throw lastError;
+  })();
+  try { return await Promise.any([server, device]); }
+  catch (error) {
+    const reason = error.errors?.find(item => item.code === "content_unavailable");
+    throw new Error(reason?.message || "暂时无法取得正文。来源可能需要登录或订阅，当前显示摘要；你可以重试或访问原站。");
+  } finally { controller.abort(); signal.removeEventListener("abort", abort); }
 }
 function updateArticle(article) {
   const index = state.articles.findIndex(item => item.id === article.id);
@@ -531,7 +593,7 @@ async function renderSettings(id) {
   const preferences = el("section", { class: "settings-section reader-settings" }, [
     el("div", { class: "section-heading" }, el("h2", { text: "阅读与收取" })),
     el("dl", { class: "reading-preferences" }, [el("dt", { text: "收取时区" }), el("dd", { text: state.settings.timezone }), el("dt", { text: "资讯排序" }), el("dd", { text: "按来源发布时间，由新到旧" }), el("dt", { text: "公司焦点" }), el("dd", { text: "在当前浏览器记住你的公司、联赛与球队选择" })]),
-    el("p", { class: "field-caption", text: "打开资讯会标为已读；收藏可用于稍后阅读。摘要来自公开来源，完整报道请前往原文。" })
+    el("p", { class: "field-caption", text: "打开资讯会标为已读；收藏可用于稍后阅读。公开页面中可取得的正文会直接在本站显示。" })
   ]);
   const translation = el("section", { class: "settings-section translation-settings" }, loading("正在载入翻译设置…"));
   main.replaceChildren(heading("设置", "让阅读更适合你的节奏。"), account, preferences, translation);
@@ -562,7 +624,7 @@ function translationForm(config, renderId) {
   const save = el("button", { type: "submit", class: "button button-primary" }, "保存翻译设置");
   const fetchModels = button("保存并获取模型", loadModels, "button");
   const form = el("form", { class: "translation-form" }, [
-    el("p", { class: "field-caption", text: "列表自动显示中文标题和摘要；打开资讯后先显示原文，点击“翻译”才显示译文。已有译文会复用。" }),
+    el("p", { class: "field-caption", text: "列表自动显示中文标题和摘要；打开资讯后先显示原文，点击“翻译正文”才翻译正文。已有译文会复用。" }),
     el("div", { class: "translation-options" }, [enabled, automatic]),
     el("div", { class: "translation-grid" }, [formField("供应商", provider), formField("接口协议", protocol)]),
     formField("API 地址", baseUrl, "填写供应商的 HTTPS 接口地址；DeepSeek Anthropic 可直接使用上面的示例。"),
@@ -572,7 +634,7 @@ function translationForm(config, renderId) {
     el("div", { class: "translation-model-actions" }, [fetchModels, el("small", { text: "先保存接口和 Key，再获取模型列表。供应商未提供列表时可手动填写。" })]),
     el("div", { class: "translation-prompt-heading" }, [formField("分领域翻译提示词", category), button("恢复当前领域默认提示词", () => { prompt.value = config.default_prompts[promptCategory]; prompts[promptCategory] = prompt.value; }, "button button-small")]),
     formField("提示词内容", prompt, "游戏、体育、金融和政治分别保存。内置提示词保留术语、专名、数字和原文的不确定性，你可以自行修改。"),
-    el("p", { class: "field-caption", text: "翻译调用你选择的供应商并消耗 API 额度。当前覆盖新闻标题与来源摘要，报道全文请前往原始网站。" }),
+    el("p", { class: "field-caption", text: "翻译调用你选择的供应商并消耗 API 额度。列表仅自动翻译标题和摘要；站内正文手动翻译，长文章会消耗更多额度。" }),
     message,
     el("div", { class: "form-footer" }, save)
   ]);
@@ -691,6 +753,7 @@ async function pollStatus() {
 
 document.querySelectorAll("[data-icon]").forEach(node => node.replaceChildren(icon(node.dataset.icon)));
 $("#modal-close").addEventListener("click", closeModal);
+modal.addEventListener("close", () => { if (!modal.open) { articleContentController?.abort(); articleContentController = null; } });
 modal.addEventListener("click", event => { if (event.target === modal) { const rect = modal.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) closeModal(); } });
 $("#header-fetch").addEventListener("click", requestFetch);
 window.addEventListener("hashchange", () => { if (state.session?.authenticated) route(); });

@@ -147,6 +147,16 @@ class Database:
                     fingerprint TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
                     provider TEXT NOT NULL, model TEXT NOT NULL, translated_at TEXT NOT NULL,
                     PRIMARY KEY(article_id,fingerprint));
+                CREATE TABLE IF NOT EXISTS article_content (
+                    article_id INTEGER PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+                    source_url TEXT NOT NULL, paragraphs TEXT NOT NULL, author TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS article_content_translations (
+                    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                    fingerprint TEXT NOT NULL, part INTEGER NOT NULL,
+                    title TEXT NOT NULL, paragraphs TEXT NOT NULL,
+                    provider TEXT NOT NULL, model TEXT NOT NULL, translated_at TEXT NOT NULL,
+                    PRIMARY KEY(article_id,fingerprint,part));
             """)
             watch_columns = {row["name"] for row in conn.execute("PRAGMA table_info(watches)")}
             if "league_id" not in watch_columns:
