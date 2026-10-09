@@ -21,7 +21,7 @@ from .collector import Collector, fetch_config, fetch_public, rematch_watch, res
 from .browser import browser_cache_url, browser_source_urls, parse_browser_feed
 from .db import Database, utc_now
 from .dns import dns_mode
-from .models import ArticlePatch, BrowserFeed, CATEGORIES, Credentials, FetchRequest, Schedule, Settings, Setup, Source, Watch
+from .models import ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, Schedule, Settings, Setup, Source, Watch
 from .scheduler import Scheduler, next_run, schedule_from_row
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -105,7 +105,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await scheduler.stop()
         await collector.stop()
 
-    app = FastAPI(title="Newsroom", version="1.1.6", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.1.7", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -554,6 +554,19 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
                 conn.execute("INSERT INTO metadata(key,value) VALUES('last_success_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now,))
                 conn.execute("INSERT INTO runs(trigger,started_at,finished_at,status,new_count,source_count) VALUES('browser',?,?,'success',?,1)", (now, now, new_count))
         return {"source_id": body.source_id, "new_count": new_count, "item_count": len(articles)}
+
+    @app.post("/api/browser/report", dependencies=[Depends(require_auth)])
+    def browser_report(body: BrowserReport):
+        errors = []
+        with db.connection(write=True) as conn:
+            for failure in body.failures:
+                row = conn.execute("SELECT * FROM sources WHERE id=? AND enabled=1 AND kind='rss'", (failure.source_id,)).fetchone()
+                if row is not None and row["url"] == failure.source_url and row["url"] in browser_urls:
+                    errors.append(f"{row['name']}: {failure.reason}")
+            if errors:
+                now = utc_now()
+                conn.execute("INSERT INTO runs(trigger,started_at,finished_at,status,new_count,source_count,error) VALUES('browser',?,?,'failed',0,?,?)", (now, now, len(errors), "；".join(errors)[:4000]))
+        return {"recorded": bool(errors)}
 
     @app.get("/api/network", dependencies=[Depends(require_admin)])
     def network():

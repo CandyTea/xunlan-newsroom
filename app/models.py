@@ -140,6 +140,16 @@ class BrowserFeed(StrictModel):
     content: str = Field(max_length=2 * 1024 * 1024)
 
 
+class BrowserFailure(StrictModel):
+    source_id: int = Field(gt=0)
+    source_url: str = Field(min_length=1, max_length=2048)
+    reason: str = Field(min_length=1, max_length=800)
+
+
+class BrowserReport(StrictModel):
+    failures: list[BrowserFailure] = Field(min_length=1, max_length=20)
+
+
 class ArticlePatch(StrictModel):
     saved: bool | None = None
     read: bool | None = None

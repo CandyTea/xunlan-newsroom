@@ -30,8 +30,7 @@ const state = { session: null, view: "news", category: "", q: "", saved: false, 
 const $ = (selector, root = document) => root.querySelector(selector);
 const main = $("#main-content");
 const modal = $("#modal");
-const deviceNews = { enabled: true, busy: false, lastAttempt: 0, message: "", controller: null, failed: [] };
-try { deviceNews.enabled = localStorage.getItem("xunlan.device-news") !== "off"; } catch { /* Use the default when storage is unavailable. */ }
+const deviceNews = { busy: false, lastAttempt: 0, controller: null, pending: null };
 
 function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
@@ -178,34 +177,20 @@ async function enterApp() {
   await refreshData(); if (!state.session?.authenticated) return;
   restoreFocus();
   route();
-  if (deviceNews.enabled) collectDeviceNews();
+  collectDeviceNews();
 }
 
-function deviceNewsText() {
-  return deviceNews.message || (deviceNews.enabled ? "海外资讯通过当前设备补收，打开网页即可使用。" : "当前设备补收已关闭。");
-}
-function deviceNewsNotice() {
-  return el("p", { class: "device-news-status", "data-device-news-status": true, role: "status", text: deviceNewsText() });
-}
-function updateDeviceNewsStatus() {
-  document.querySelectorAll("[data-device-news-status]").forEach(node => { node.textContent = deviceNewsText(); });
-  updateFetchButtons();
-}
-function setDeviceNewsEnabled(enabled) {
-  deviceNews.enabled = enabled;
-  try { localStorage.setItem("xunlan.device-news", enabled ? "on" : "off"); } catch { /* This choice still applies to the current page. */ }
-  deviceNews.message = "";
-  if (!enabled) deviceNews.controller?.abort();
-  updateDeviceNewsStatus();
-  if (enabled) collectDeviceNews();
-}
 async function collectDeviceNews(categories = Object.keys(CATEGORIES)) {
-  if (deviceNews.busy || !state.session?.authenticated) return [];
+  if (deviceNews.busy) return deviceNews.pending;
+  if (!state.session?.authenticated) return [];
   const session = state.session;
   const controller = new AbortController();
-  let failed = false;
-  deviceNews.controller = controller; deviceNews.busy = true; deviceNews.lastAttempt = Date.now(); deviceNews.failed = [];
-  deviceNews.message = "正在通过当前设备补收海外资讯…"; updateDeviceNewsStatus();
+  deviceNews.controller = controller; deviceNews.busy = true; deviceNews.lastAttempt = Date.now();
+  deviceNews.pending = collectDeviceFeeds(categories, session, controller);
+  try { return await deviceNews.pending; }
+  finally { deviceNews.busy = false; deviceNews.controller = null; deviceNews.pending = null; }
+}
+async function collectDeviceFeeds(categories, session, controller) {
   try {
     const data = await api("/browser/sources", { signal: controller.signal });
     if (controller.signal.aborted) return [];
@@ -216,22 +201,18 @@ async function collectDeviceNews(categories = Object.keys(CATEGORIES)) {
         if (controller.signal.aborted || state.session !== session) throw new Error("当前收取已取消");
         return api("/browser/import", { method: "POST", body, signal: controller.signal });
       },
-      onProgress: (done, total) => { deviceNews.message = `当前设备正在补收海外资讯 · ${done}/${total}`; updateDeviceNewsStatus(); },
     });
     if (controller.signal.aborted) return [];
-    deviceNews.failed = result.failed;
-    deviceNews.message = sources.length ? `当前设备补收 ${result.sourceIds.length}/${sources.length} 个来源，新增 ${result.newCount} 条${result.failed.length ? `；暂时失败：${result.failed.map(item => `${item.name}（${item.reason}）`).join("；")}` : ""}` : "当前栏目没有启用可通过设备补收的预置海外来源。";
+    if (result.failed.length) {
+      try { await api("/browser/report", { method: "POST", body: { failures: result.failed.map(({ source_id, source_url, reason }) => ({ source_id, source_url, reason: reason.slice(0, 800) })) }, signal: controller.signal }); }
+      catch (error) { if (error.status === 401 || controller.signal.aborted) return []; }
+    }
     await refreshData();
-    if (["news", "following"].includes(state.view) && !state.manageWatches && !modal.open) await renderView();
+    if (result.newCount && !document.hidden && ["news", "following"].includes(state.view) && !state.manageWatches && !modal.open) await renderReader(++state.renderId, true);
     return result.sourceIds;
-  } catch (error) {
-    failed = !controller.signal.aborted;
+  } catch {
     controller.abort();
-    if (state.session?.authenticated) deviceNews.message = `当前设备补收未完成：${error.message}`;
     return [];
-  } finally {
-    if (controller.signal.aborted && !failed) deviceNews.message = deviceNews.enabled ? "当前设备补收已停止，可重新收取。" : "当前设备补收已关闭。";
-    deviceNews.busy = false; deviceNews.controller = null; updateDeviceNewsStatus();
   }
 }
 function route() {
@@ -331,7 +312,7 @@ function readerEmpty() {
   if (state.view === "following") return empty(state.watches.length ? "等待你的关注资讯" : "从一个关注对象开始", state.watches.length ? "目前还没有资讯命中关注对象。收取新资讯，或编辑别名与上下文关键词来调整匹配。" : "添加公司、工作室、球队、国家或政客。讯览会从真实资讯中找出相关报道。", [button(state.watches.length ? "管理关注" : "添加关注", () => state.watches.length ? showWatchManager() : watchForm(), "button button-primary", "plus"), state.watches.length && button("收取资讯", () => requestFetch(), "button", "refresh")].filter(Boolean), "bookmark");
   return empty("阅读室已准备好", "收取第一批报道，或先添加感兴趣的公司、联赛与球队，再设置每天的收取时间。", [button("收取资讯", () => requestFetch(), "button button-primary", "refresh"), button("添加关注", () => watchForm(), "button", "plus")]);
 }
-async function renderReader(id) {
+async function renderReader(id, quiet = false) {
   const following = state.view === "following";
   const subtitle = following ? "从已收取的资讯中，找到你关心的人和事。" : "按栏目阅读，按兴趣关注。";
   const head = heading(following ? "我的关注" : "今日资讯", subtitle, following ? [button("管理关注", showWatchManager, "button", "edit")] : []);
@@ -343,8 +324,9 @@ async function renderReader(id) {
     const watchSelect = select("watch_id", { "": "全部关注对象", ...Object.fromEntries(state.watches.map(w => [w.id, w.name])) }, state.watchId, { class: "watch-selector", "aria-label": "筛选关注对象", onchange: event => setFilter("watchId", event.target.value) });
     tools.append(watchSelect);
   }
-  const list = el("div", { id: "reader-list", "aria-live": "polite" }, loading("正在载入资讯…"));
-  main.replaceChildren(head, deviceNewsNotice(), following && !state.watches.length ? el("div", { class: "following-intro" }, [el("p", {}, [el("strong", { text: "还没有关注对象" }), " · 添加关注后，相关资讯会出现在这里。"]), button("添加", () => watchForm(), "button button-small", "plus")]) : "", categories, !following && focusBar(), tools, list);
+  const list = quiet ? $("#reader-list") : el("div", { id: "reader-list", "aria-live": "polite" }, loading("正在载入资讯…"));
+  if (!list) return;
+  if (!quiet) main.replaceChildren(head, following && !state.watches.length ? el("div", { class: "following-intro" }, [el("p", {}, [el("strong", { text: "还没有关注对象" }), " · 添加关注后，相关资讯会出现在这里。"]), button("添加", () => watchForm(), "button button-small", "plus")]) : "", categories, !following && focusBar(), tools, list);
   try {
     const params = new URLSearchParams({ page: String(state.page), page_size: String(state.pageSize), following: String(following), saved: String(state.saved), unread: String(state.unread) });
     if (state.category) params.set("category", state.category); if (state.q) params.set("q", state.q); if (state.watchId) params.set("watch_id", state.watchId);
@@ -354,13 +336,15 @@ async function renderReader(id) {
         else { if (state.leagueId) params.set("league_id", state.leagueId); if (state.teamId) params.set("team_id", state.teamId); }
       } else if (state.companyId) params.set("company_id", state.companyId);
     }
-    const data = await api(`/articles?${params}`); if (id !== state.renderId) return;
+    const data = await api(`/articles?${params}`); if (id !== state.renderId || (quiet && (modal.open || document.hidden))) return;
+    const scrollY = window.scrollY;
     state.articles = data.items || []; state.total = data.total || 0;
     if (!state.articles.length) { list.replaceChildren(readerEmpty()); return; }
     list.replaceChildren(el("div", { class: "list-meta" }, [el("span", { text: `共 ${state.total} 条${following ? "关注" : ""}资讯` }), el("span", { text: "按发布时间排序" })]), el("div", { class: "news-list" }, state.articles.map(articleRow)));
     const pages = Math.ceil(state.total / state.pageSize);
     if (pages > 1) list.append(el("nav", { class: "pagination", "aria-label": "资讯分页" }, [button("上一页", () => changePage(-1), "button button-small", null, { disabled: state.page <= 1 }), el("span", { text: `${state.page} / ${pages}` }), button("下一页", () => changePage(1), "button button-small", null, { disabled: state.page >= pages })]));
-  } catch (error) { if (id === state.renderId && error.status !== 401) list.replaceChildren(errorPanel(error, renderView)); }
+    if (quiet) window.scrollTo({ top: scrollY, behavior: "instant" });
+  } catch (error) { if (!quiet && id === state.renderId && error.status !== 401) list.replaceChildren(errorPanel(error, renderView)); }
 }
 function changePage(delta) { state.page += delta; renderView(); window.scrollTo({ top: 0, behavior: "instant" }); }
 function articleRow(article) {
@@ -480,15 +464,7 @@ function renderSettings() {
     el("dl", { class: "reading-preferences" }, [el("dt", { text: "收取时区" }), el("dd", { text: state.settings.timezone }), el("dt", { text: "资讯排序" }), el("dd", { text: "按来源发布时间，由新到旧" }), el("dt", { text: "公司焦点" }), el("dd", { text: "在当前浏览器记住你的公司、联赛与球队选择" })]),
     el("p", { class: "field-caption", text: "打开资讯会标为已读；收藏可用于稍后阅读。摘要来自公开来源，完整报道请前往原文。" })
   ]);
-  const device = el("section", { class: "settings-section reader-settings" }, [
-    el("div", { class: "section-heading" }, el("h2", { text: "海外资讯" })),
-    el("label", { class: "checkbox-label" }, [input("device_news", "on", { type: "checkbox", checked: deviceNews.enabled, onchange: event => setDeviceNewsEnabled(event.target.checked) }), "通过当前设备补收海外资讯"]),
-    el("p", { class: "field-caption", text: "手机和电脑直接打开网页即可。优先读取 GitHub 定时采集的公开新闻缓存；缓存不可用时，ESPN 尝试直连，再尝试 rss2json、AllOrigins 转接。缓存和转接只处理预置公开 RSS，不上传你的账号或关注词条，可能延迟或暂时失败。" }),
-    el("p", { class: "field-caption", text: "补收的新闻保存到现有阅读室，沿用公司、联赛和球队筛选。关闭网页后，固定时间的收取继续由服务器执行，设备补收暂停。此开关仅在当前浏览器保存。" }),
-    deviceNewsNotice(),
-    button("重新补收", () => collectDeviceNews(), "button button-small", "refresh", { "data-device-fetch-button": true, disabled: deviceNews.busy }),
-  ]);
-  main.replaceChildren(heading("设置", "让阅读更适合你的节奏。"), account, preferences, device);
+  main.replaceChildren(heading("设置", "让阅读更适合你的节奏。"), account, preferences);
 }
 async function logout() {
   deviceNews.controller?.abort();
@@ -505,22 +481,20 @@ function renderSidebar() {
   $("#sidebar").replaceChildren(runtime, watches, note);
 }
 function updateFetchButtons() {
-  const busy = Boolean(state.status.fetching || state.fetching || deviceNews.busy);
+  const busy = Boolean(state.status.fetching || state.fetching);
   $("#header-fetch").disabled = busy; $("#header-fetch").setAttribute("aria-label", busy ? "正在收取资讯" : "收取资讯");
   const span = $("#header-fetch span:last-child"); if (span) span.textContent = busy ? "正在收取…" : "收取资讯";
   document.querySelectorAll("[data-fetch-button]").forEach(node => { node.disabled = busy; });
-  document.querySelectorAll("[data-device-fetch-button]").forEach(node => { node.disabled = deviceNews.busy; });
 }
 function requestFetch() {
-  if (state.status.fetching || state.fetching || deviceNews.busy) { toast("资讯正在收取，请稍候。"); return; }
-  const form = el("form", { class: "modal-form" }, [el("p", { class: "field-caption", text: "从已启用的来源收取最新资讯。通过当前设备补收时，请保持网页打开；你可以继续阅读。" }), el("fieldset", {}, [el("legend", { text: "选择收取栏目" }), choices("categories", CATEGORIES, state.category ? [state.category] : Object.keys(CATEGORIES))]), check("device_news", "通过当前设备补收海外资讯", deviceNews.enabled), formFooter("开始收取")]);
+  if (state.status.fetching || state.fetching) { toast("资讯正在收取，请稍候。"); return; }
+  const form = el("form", { class: "modal-form" }, [el("p", { class: "field-caption", text: "选择需要更新的栏目，你可以继续阅读。" }), el("fieldset", {}, [el("legend", { text: "选择收取栏目" }), choices("categories", CATEGORIES, state.category ? [state.category] : Object.keys(CATEGORIES))]), formFooter("开始收取")]);
   form.addEventListener("submit", async event => {
     event.preventDefault(); const categories = new FormData(form).getAll("categories"); if (!categories.length) { modalError(form, new Error("请至少选择一个栏目。")); return; }
-    const useDevice = new FormData(form).has("device_news");
     const session = state.session;
     const submit = $("[type=submit]", form); submit.disabled = true; state.fetching = true; closeModal(); updateFetchButtons();
     try {
-      const skip_source_ids = useDevice ? await collectDeviceNews(categories) : [];
+      const skip_source_ids = await collectDeviceNews(categories);
       if (state.session !== session || !state.session?.authenticated) return;
       const result = await api("/fetch", { method: "POST", body: { categories, skip_source_ids } });
       toast(result.message || "已开始收取，完成后资讯会自动更新"); state.status.fetching = true; renderSidebar(); await pollStatus();
@@ -532,13 +506,11 @@ async function pollStatus() {
   state.pollBusy = true;
   try {
     const wasFetching = Boolean(state.status.fetching); state.status = await api("/status"); renderSidebar(); updateFetchButtons();
-    if (!wasFetching && state.status.fetching && deviceNews.enabled && !state.fetching && Date.now() - deviceNews.lastAttempt > 60000) collectDeviceNews();
+    if (!wasFetching && state.status.fetching && !state.fetching && Date.now() - deviceNews.lastAttempt > 60000) collectDeviceNews();
     if (wasFetching && !state.status.fetching) {
-      const result = state.status.last_run;
-      toast(result?.status === "partial" ? "收取完成，部分来源暂时失败；已收取的资讯可正常阅读" : result?.status === "failed" ? "本次收取失败，请稍后重试" : result?.status === "interrupted" ? "收取已中断，可重新收取" : "收取已完成");
-      if (["news", "following"].includes(state.view) && !state.manageWatches) renderView();
+      if (["news", "following"].includes(state.view) && !state.manageWatches && !modal.open) renderReader(++state.renderId, true);
     }
-    if (deviceNews.enabled && !deviceNews.busy && !state.fetching && Date.now() - deviceNews.lastAttempt >= 15 * 60000) collectDeviceNews();
+    if (!deviceNews.busy && !state.fetching && Date.now() - deviceNews.lastAttempt >= 15 * 60000) collectDeviceNews();
   } catch (error) { if (error.status === 401) showAuth(); } finally { state.pollBusy = false; }
 }
 

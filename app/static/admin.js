@@ -106,7 +106,7 @@ async function renderAdmin() {
     state.settings = settings; state.sources = sources.items || []; state.status = status; state.network = network; updateExpiry();
     main.replaceChildren(
       el("div", { class: "view-heading" }, el("div", {}, [el("h1", { text: "收取管理" }), el("p", { text: "管理来源、服务端收取偏好与执行记录。" })])),
-      section("来源连接", "本页重试由服务器执行。设备补收请返回阅读页，在「设置 → 海外资讯」中启动。", networkBox()),
+      section("来源连接", "本页重试由服务器执行。阅读页会自动补收海外资讯，路线错误记录在下方的最近收取记录。", networkBox()),
       section("资讯来源", "仅支持公开 RSS / Atom 与 Steam 官方资讯。", el("div", { id: "source-list", class: "manage-list sources-list" }, state.sources.length ? state.sources.map(sourceRow) : el("p", { class: "inline-empty", text: "还没有来源。添加公开订阅地址或 Steam 游戏 App ID。" })), button("添加来源", () => sourceForm(), "button button-small", "plus")),
       section("服务端收取偏好", "时区影响所有收取计划，补收会合并遗漏的任务。", settingsForm()),
       section("收取状态", "计划与手动收取共用已启用的来源。", el("div", { id: "admin-status" }, statusBox())),
@@ -123,7 +123,7 @@ function sourceHint(error) {
   if (/HTTP 403/.test(error)) return "来源拒绝了访问；稍后再试或检查来源的访问限制。";
   if (/HTTP 404/.test(error)) return "订阅地址可能已变更，请核对来源官方网站。";
   if (/XML|JSON|格式|内容/.test(error)) return "返回内容不是有效订阅数据，请核对订阅地址。";
-  if (/超时|连接/.test(error)) return "这是服务器请求失败。预置海外 RSS 可返回阅读页，在「设置 → 海外资讯」点击「重新补收」，查看手机或电脑的收取结果。本页重试仍使用服务器网络。";
+  if (/超时|连接/.test(error)) return "这是服务器请求失败。阅读页会通过当前设备自动补收预置海外资讯；具体路线错误查看最近收取记录中的「当前设备补收」。本页重试仍使用服务器网络。";
   return "请核对来源地址和最近收取记录。";
 }
 function networkBox() {

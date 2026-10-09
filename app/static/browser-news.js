@@ -100,10 +100,10 @@ window.BrowserNews = (() => {
           } catch (error) {
             if (signal.aborted) return;
             if ([401, 403].includes(error.status)) throw error;
-            result.failed.push({ name: source.name, reason: error.message });
+            result.failed.push({ source_id: source.id, source_url: source.url, name: source.name, reason: error.message });
           }
-        } else result.failed.push({ name: source.name, reason: failures.join("；") });
-        onProgress(++completed, sources.length, result);
+        } else result.failed.push({ source_id: source.id, source_url: source.url, name: source.name, reason: failures.join("；") });
+        onProgress?.(++completed, sources.length, result);
       }
     }
     await Promise.all([worker(), worker()]);
