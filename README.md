@@ -1,8 +1,10 @@
-# 讯览（Newsroom）v1.1.5
+# 讯览（Newsroom）v1.1.6
 
 讯览是一款单用户、自托管的新闻阅读器。它按游戏、体育、股票和国际新闻分类汇总来源，支持关注词条、收藏、已读状态与定时抓取。视觉方向以财新现有识别度为灵感。
 
 部署在服务器后，手机和电脑直接打开网站登录即可使用，无需安装客户端、浏览器扩展或 Python。v1.1.5 在现有网页增加当前设备补收海外 RSS：请求从打开网页的设备发出，已取得的资讯保存到现有阅读室，继续使用原有账号、关注、收藏和筛选。
+
+v1.1.6 增加 GitHub Actions 公开 RSS 缓存路线，避免设备只能依赖公开转接。网页优先读取 `news-cache` 分支中的缓存；缓存尚未生成、超过 6 小时或无法读取时，尝试原有直连和转接路线。每条失败路线的原因显示在阅读页，管理页明确标注服务器失败，避免混淆。
 
 ![桌面阅读界面](docs/screenshots/desktop.png)
 
@@ -86,7 +88,17 @@ Steam 环世界（App ID `294100`）和只狼（App ID `814380`）是可选示�
 
 「设置 → 海外资讯 → 通过当前设备补收海外资讯」默认开启，选择保存在当前浏览器。登录打开网页时自动补收；页面可见时每 15 分钟补收一次，观察到服务端收取开始时也会尝试补收。手动「收取资讯」可选择栏目与是否使用当前设备，并跳过本轮已通过设备成功收取的来源，随后让服务器收取剩余来源。每个来源完成后立即保存，重复新闻按原有规则去重。
 
-设备补收目前只用于已启用的预置 BBC、ESPN、The Guardian 和 FT 中文网 RSS 地址。ESPN 优先直接读取；直连不可用或来源不支持浏览器跨域时，尝试 [rss2json](https://rss2json.com/docs)，失败后尝试 [AllOrigins](https://allorigins.win/) 转接。这些请求使用设备的浏览器网络，服务器只负责接收和保存结果，不需要为补收连接海外 RSS。
+设备补收目前只用于已启用的预置 BBC、ESPN、The Guardian 和 FT 中文网 RSS 地址。优先通过设备网络读取 GitHub 公开 RSS 缓存；缓存不可用时，ESPN 尝试直接读取，再尝试 [rss2json](https://rss2json.com/docs) 和 [AllOrigins](https://allorigins.win/) 转接。这些请求使用设备的浏览器网络，服务器只负责接收和保存结果，不需要为补收连接海外 RSS。
+
+### GitHub 定时新闻缓存
+
+工作流文件为 `.github/workflows/overseas-feeds.yml`。需要在 GitHub 仓库允许 Actions 运行，并允许该工作流写入仓库。它计划每小时第 7、37 分钟执行，也可以在 Actions 中选择 `Overseas news cache → Run workflow` 手动启动。GitHub 调度可能延迟，不能用作精确到点的收取承诺；参考 [GitHub 调度事件说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)。
+
+采集在 GitHub 托管的运行环境中执行，将预置公开 RSS 保存到单独的 `news-cache` 分支。只保存来源 URL、RSS 内容、采集时间及来源成功/失败记录；不读取服务器数据库、账号、关注对象或代理配置，也不修改 `main` 的应用代码。失败来源保留上一份缓存及其原始时间，网页拒绝超过 6 小时的缓存，避免把旧新闻当作新收取。缓存地址固定指向 `CandyTea/xunlan-newsroom`；复制项目到其他仓库时需调整 `app/browser.py` 的缓存地址。
+
+工作流在启用后会按计划采集，并在修改采集代码时触发一次生产采集；没有配置任何测试任务。能否成功连接 BBC 仍取决于 GitHub 运行环境，缓存首次产生前该路线会返回不可用。查看 Actions 和 `news-cache/public-feeds/manifest.json` 可判断实际采集情况。
+
+首次推送工作流需要 GitHub 登录凭据具备 `workflow` 权限；只有 `repo` 权限时无法新增工作流。参考 [GitHub OAuth 权限说明](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps)。普通后续代码更新无需反复授权。
 
 转接服务收到公开 RSS 地址和设备出口信息；请求不携带讯览登录凭据、关注词条或其他私人配置。浏览器存在 [跨域限制](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS)，单靠设备能访问网站不足以读取所有 RSS，所以需要转接。转接可能缓存、限流或不可达；rss2json 未配置 API 密钥时默认只提供 10 条，不保证完整历史或实时更新。页面显示本轮完成数量、新增数量和暂时失败的来源，可以重新补收。
 

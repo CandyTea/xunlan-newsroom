@@ -34,6 +34,14 @@ window.BrowserNews = (() => {
         content = await response.text();
         if (new TextEncoder().encode(content).byteLength > MAX_BYTES) throw new Error("来源内容超过 2 MB");
       }
+      if (route.format === "cache") {
+        const data = JSON.parse(content);
+        const fetchedAt = Date.parse(data.fetched_at);
+        if (data.source_url !== route.sourceUrl || typeof data.content !== "string" || !Number.isFinite(fetchedAt)) throw new Error("缓存格式或来源不匹配");
+        if (Date.now() - fetchedAt > 6 * 3600000 || fetchedAt - Date.now() > 5 * 60000) throw new Error("缓存已过期或时间无效");
+        content = data.content;
+        if (new TextEncoder().encode(content).byteLength > MAX_BYTES) throw new Error("缓存内容超过 2 MB");
+      }
       if (route.format === "rss2json") {
         const data = JSON.parse(content);
         if (data.status !== "ok" || !Array.isArray(data.items)) throw new Error("转接未返回有效资讯");
@@ -42,7 +50,12 @@ window.BrowserNews = (() => {
         const xml = new DOMParser().parseFromString(content, "application/xml");
         if (xml.querySelector("parsererror") || !["rss", "feed", "RDF"].includes(xml.documentElement.localName)) throw new Error("来源未返回 RSS 或 Atom");
       }
-      return content;
+      return { content, format: route.format === "rss2json" ? "rss2json" : "rss" };
+    } catch (error) {
+      if (controller.signal.aborted && !signal.aborted) throw new Error("请求超过 15 秒，已超时");
+      if (error instanceof TypeError) throw new Error("浏览器无法读取响应，可能是网络或跨域限制");
+      if (error instanceof SyntaxError) throw new Error("返回内容不是有效 JSON");
+      throw error;
     } finally {
       clearTimeout(timeout);
       signal.removeEventListener("abort", abort);
@@ -52,10 +65,11 @@ window.BrowserNews = (() => {
   function routes(source) {
     const encoded = encodeURIComponent(source.url);
     const options = [
-      { url: `https://api.rss2json.com/v1/api.json?rss_url=${encoded}`, format: "rss2json" },
-      { url: `https://api.allorigins.win/raw?url=${encoded}`, format: "rss" },
+      { name: "rss2json", url: `https://api.rss2json.com/v1/api.json?rss_url=${encoded}`, format: "rss2json" },
+      { name: "AllOrigins", url: `https://api.allorigins.win/raw?url=${encoded}`, format: "rss" },
     ];
-    if (new URL(source.url).hostname === "www.espn.com") options.unshift({ url: source.url, format: "rss" });
+    if (new URL(source.url).hostname === "www.espn.com") options.unshift({ name: "直接读取", url: source.url, format: "rss" });
+    if (source.cache_url) options.unshift({ name: "GitHub 新闻缓存", url: source.cache_url, sourceUrl: source.url, format: "cache" });
     return options;
   }
 
@@ -68,11 +82,12 @@ window.BrowserNews = (() => {
         const source = sources[next++];
         let content;
         let format;
+        const failures = [];
         for (const route of routes(source)) {
-          try { content = await readFeed(route, signal); format = route.format; break; }
+          try { const feed = await readFeed(route, signal); content = feed.content; format = feed.format; break; }
           catch (error) {
             if (signal.aborted) return;
-            // Import failures are handled separately; only external reads switch routes.
+            failures.push(`${route.name}：${error.message}`);
           }
         }
         if (signal.aborted) return;
@@ -87,7 +102,7 @@ window.BrowserNews = (() => {
             if ([401, 403].includes(error.status)) throw error;
             result.failed.push({ name: source.name, reason: error.message });
           }
-        } else result.failed.push({ name: source.name, reason: "直连或转接不可用，请稍后重试" });
+        } else result.failed.push({ name: source.name, reason: failures.join("；") });
         onProgress(++completed, sources.length, result);
       }
     }

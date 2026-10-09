@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .collector import Collector, fetch_config, fetch_public, rematch_watch, resolve_public_url, watch_from_row
-from .browser import browser_source_urls, parse_browser_feed
+from .browser import browser_cache_url, browser_source_urls, parse_browser_feed
 from .db import Database, utc_now
 from .dns import dns_mode
 from .models import ArticlePatch, BrowserFeed, CATEGORIES, Credentials, FetchRequest, Schedule, Settings, Setup, Source, Watch
@@ -105,7 +105,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await scheduler.stop()
         await collector.stop()
 
-    app = FastAPI(title="Newsroom", version="1.1.5", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.1.6", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -117,7 +117,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; connect-src 'self' https://www.espn.com https://api.rss2json.com https://api.allorigins.win; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; connect-src 'self' https://raw.githubusercontent.com https://www.espn.com https://api.rss2json.com https://api.allorigins.win; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         if request.url.path.startswith("/api/") or request.url.path in ("/", "/admin"):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -526,7 +526,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
     @app.get("/api/browser/sources", dependencies=[Depends(require_auth)])
     def browser_sources():
         with db.connection() as conn:
-            items = [{key: row[key] for key in ("id", "name", "url", "category")}
+            items = [{**{key: row[key] for key in ("id", "name", "url", "category")}, "cache_url": browser_cache_url(row["url"])}
                      for row in conn.execute("SELECT * FROM sources WHERE enabled=1 AND kind='rss' ORDER BY id")
                      if row["url"] in browser_urls]
         return {"items": items}

@@ -1,11 +1,21 @@
 """Import public feed data obtained through the reader's browser network."""
 import json
+from hashlib import sha256
 from urllib.parse import urlsplit
 
 from .collector import MAX_BYTES, _article, parse_rss
 from .db import load_default_sources
 
 FOREIGN_HOSTS = {"feeds.bbci.co.uk", "www.espn.com", "www.theguardian.com", "www.ftchinese.com"}
+CACHE_BASE_URL = "https://raw.githubusercontent.com/CandyTea/xunlan-newsroom/news-cache/public-feeds"
+
+
+def cache_filename(source_url):
+    return sha256(source_url.encode("utf-8")).hexdigest() + ".json"
+
+
+def browser_cache_url(source_url):
+    return f"{CACHE_BASE_URL}/{cache_filename(source_url)}"
 
 
 def browser_source_urls():

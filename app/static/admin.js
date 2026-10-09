@@ -106,7 +106,7 @@ async function renderAdmin() {
     state.settings = settings; state.sources = sources.items || []; state.status = status; state.network = network; updateExpiry();
     main.replaceChildren(
       el("div", { class: "view-heading" }, el("div", {}, [el("h1", { text: "收取管理" }), el("p", { text: "管理来源、服务端收取偏好与执行记录。" })])),
-      section("来源连接", "收取由服务器执行，不使用手机或电脑浏览器的网络。", networkBox()),
+      section("来源连接", "本页重试由服务器执行。设备补收请返回阅读页，在「设置 → 海外资讯」中启动。", networkBox()),
       section("资讯来源", "仅支持公开 RSS / Atom 与 Steam 官方资讯。", el("div", { id: "source-list", class: "manage-list sources-list" }, state.sources.length ? state.sources.map(sourceRow) : el("p", { class: "inline-empty", text: "还没有来源。添加公开订阅地址或 Steam 游戏 App ID。" })), button("添加来源", () => sourceForm(), "button button-small", "plus")),
       section("服务端收取偏好", "时区影响所有收取计划，补收会合并遗漏的任务。", settingsForm()),
       section("收取状态", "计划与手动收取共用已启用的来源。", el("div", { id: "admin-status" }, statusBox())),
@@ -123,7 +123,7 @@ function sourceHint(error) {
   if (/HTTP 403/.test(error)) return "来源拒绝了访问；稍后再试或检查来源的访问限制。";
   if (/HTTP 404/.test(error)) return "订阅地址可能已变更，请核对来源官方网站。";
   if (/XML|JSON|格式|内容/.test(error)) return "返回内容不是有效订阅数据，请核对订阅地址。";
-  if (/超时|连接/.test(error)) return "可重试失败来源；持续失败时需检查服务器出口或已配置的代理。";
+  if (/超时|连接/.test(error)) return "这是服务器请求失败。预置海外 RSS 可返回阅读页，在「设置 → 海外资讯」点击「重新补收」，查看手机或电脑的收取结果。本页重试仍使用服务器网络。";
   return "请核对来源地址和最近收取记录。";
 }
 function networkBox() {
@@ -133,7 +133,7 @@ function networkBox() {
   return el("div", { id: "source-network", class: "status-box" }, [
     el("p", { class: "status-line", text: `连接方式：${modes[state.network.fetch_mode] || "未知"}；${state.network.proxy_configured ? "已配置代理" : "未配置代理"}` }),
     el("p", { class: "status-line", text: `域名解析：${dnsModes[state.network.dns_mode] || "未知"}` }),
-    el("p", { class: "field-caption", text: "备用 DNS 只处理解析故障，不提供代理出口。持续超时需要检查服务器能否连接该来源。" }),
+    el("p", { class: "field-caption", text: "这里显示服务器连接情况。备用 DNS 只处理解析故障；若服务器无法连接海外来源，可以在阅读页通过当前设备补收。设备补收的失败原因在阅读页显示。" }),
     el("div", { class: "source-retry-actions" }, [el("span", { class: "muted", text: `${failed} 个启用来源收取失败` }), button("重试失败来源", retryFailedSources, "button button-small", "refresh", { disabled: !failed || state.status.fetching || state.retrying })])
   ]);
 }
@@ -148,7 +148,7 @@ async function retryFailedSources() {
   finally { state.retrying = false; const target = $("#source-network"); if (target) target.replaceWith(networkBox()); }
 }
 function sourceRow(source) {
-  return el("article", { class: "manage-row" }, [el("div", { class: "manage-copy" }, [el("h3", { class: source.enabled ? "" : "disabled-text" }, [source.name, el("span", { class: "manage-type", text: `${CATEGORIES[source.category] || "资讯"} · ${source.kind === "steam" ? "Steam" : "RSS"}` })]), el("p", { class: "source-url", text: source.kind === "steam" ? `Steam App ID：${source.steam_appid || "未设置"}` : source.url }), el("p", { text: source.last_success_at ? `最近成功：${dateTime(source.last_success_at)}` : "尚未收取" }), source.last_error && el("p", { class: "source-error", text: source.last_error }), source.last_error && el("p", { class: "muted", text: sourceHint(source.last_error) }), !source.enabled && el("span", { class: "enabled-label off", text: "已停用" })]), el("div", { class: "row-actions" }, [button("", () => sourceForm(source), "icon-button", "edit", { "aria-label": `编辑来源 ${source.name}` }), button("", () => deleteSource(source), "icon-button", "trash", { "aria-label": `删除来源 ${source.name}` })])]);
+  return el("article", { class: "manage-row" }, [el("div", { class: "manage-copy" }, [el("h3", { class: source.enabled ? "" : "disabled-text" }, [source.name, el("span", { class: "manage-type", text: `${CATEGORIES[source.category] || "资讯"} · ${source.kind === "steam" ? "Steam" : "RSS"}` })]), el("p", { class: "source-url", text: source.kind === "steam" ? `Steam App ID：${source.steam_appid || "未设置"}` : source.url }), el("p", { text: source.last_success_at ? `最近成功（服务器或设备）：${dateTime(source.last_success_at)}` : "尚未成功收取" }), source.last_error && el("p", { class: "source-error", text: `服务器收取：${source.last_error}` }), source.last_error && el("p", { class: "muted", text: sourceHint(source.last_error) }), !source.enabled && el("span", { class: "enabled-label off", text: "已停用" })]), el("div", { class: "row-actions" }, [button("", () => sourceForm(source), "icon-button", "edit", { "aria-label": `编辑来源 ${source.name}` }), button("", () => deleteSource(source), "icon-button", "trash", { "aria-label": `删除来源 ${source.name}` })])]);
 }
 function sourceForm(source = {}) {
   const kind = select("kind", { rss: "公开 RSS / Atom", steam: "Steam 官方游戏资讯" }, source.kind || "rss");

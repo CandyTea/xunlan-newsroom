@@ -220,7 +220,7 @@ async function collectDeviceNews(categories = Object.keys(CATEGORIES)) {
     });
     if (controller.signal.aborted) return [];
     deviceNews.failed = result.failed;
-    deviceNews.message = sources.length ? `当前设备补收 ${result.sourceIds.length}/${sources.length} 个来源，新增 ${result.newCount} 条${result.failed.length ? `；暂时失败：${result.failed.map(item => item.name).join("、")}` : ""}` : "当前栏目没有启用可通过设备补收的预置海外来源。";
+    deviceNews.message = sources.length ? `当前设备补收 ${result.sourceIds.length}/${sources.length} 个来源，新增 ${result.newCount} 条${result.failed.length ? `；暂时失败：${result.failed.map(item => `${item.name}（${item.reason}）`).join("；")}` : ""}` : "当前栏目没有启用可通过设备补收的预置海外来源。";
     await refreshData();
     if (["news", "following"].includes(state.view) && !state.manageWatches && !modal.open) await renderView();
     return result.sourceIds;
@@ -483,7 +483,7 @@ function renderSettings() {
   const device = el("section", { class: "settings-section reader-settings" }, [
     el("div", { class: "section-heading" }, el("h2", { text: "海外资讯" })),
     el("label", { class: "checkbox-label" }, [input("device_news", "on", { type: "checkbox", checked: deviceNews.enabled, onchange: event => setDeviceNewsEnabled(event.target.checked) }), "通过当前设备补收海外资讯"]),
-    el("p", { class: "field-caption", text: "手机和电脑直接打开网页即可。页面可见时自动补收，也可以手动收取。ESPN 优先直连，其他预置海外 RSS 使用 rss2json、AllOrigins 公开转接；转接只接收公开订阅地址，不发送账号或关注词条，可能缓存或暂时失败。" }),
+    el("p", { class: "field-caption", text: "手机和电脑直接打开网页即可。优先读取 GitHub 定时采集的公开新闻缓存；缓存不可用时，ESPN 尝试直连，再尝试 rss2json、AllOrigins 转接。缓存和转接只处理预置公开 RSS，不上传你的账号或关注词条，可能延迟或暂时失败。" }),
     el("p", { class: "field-caption", text: "补收的新闻保存到现有阅读室，沿用公司、联赛和球队筛选。关闭网页后，固定时间的收取继续由服务器执行，设备补收暂停。此开关仅在当前浏览器保存。" }),
     deviceNewsNotice(),
     button("重新补收", () => collectDeviceNews(), "button button-small", "refresh", { "data-device-fetch-button": true, disabled: deviceNews.busy }),
