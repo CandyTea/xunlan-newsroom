@@ -155,6 +155,60 @@ class ArticlePatch(StrictModel):
     read: bool | None = None
 
 
+class TranslationPrompts(StrictModel):
+    games: str = Field(min_length=1, max_length=6000)
+    sports: str = Field(min_length=1, max_length=6000)
+    stocks: str = Field(min_length=1, max_length=6000)
+    politics: str = Field(min_length=1, max_length=6000)
+
+    @field_validator("games", "sports", "stocks", "politics")
+    @classmethod
+    def nonempty_prompt(cls, value):
+        if not value.strip():
+            raise ValueError("提示词不能为空")
+        return value.strip()
+
+
+class TranslationSettings(StrictModel):
+    provider: Literal["deepseek_anthropic", "deepseek_openai", "anthropic", "custom"]
+    protocol: Literal["anthropic", "openai"]
+    base_url: str = Field(min_length=1, max_length=2048)
+    model: str = Field(default="", max_length=200)
+    api_key: str | None = Field(default=None, max_length=4096)
+    clear_api_key: bool = False
+    enabled: bool = True
+    auto_translate_list: bool = True
+    prompts: TranslationPrompts
+
+    @field_validator("base_url")
+    @classmethod
+    def secure_api_url(cls, value):
+        normalized = public_url_syntax(value)
+        parts = urlsplit(value.strip())
+        if parts.scheme != "https" or parts.query or parts.fragment:
+            raise ValueError("翻译接口必须是不含查询参数的公网 HTTPS 地址")
+        return normalized.rstrip("/")
+
+    @field_validator("api_key")
+    @classmethod
+    def clean_api_key(cls, value):
+        if value is None or not value.strip():
+            return None
+        value = value.strip()
+        if any(ord(char) < 33 or ord(char) > 126 for char in value):
+            raise ValueError("API Key 不应包含空格或控制字符")
+        return value
+
+    @field_validator("model")
+    @classmethod
+    def clean_model(cls, value):
+        return value.strip()
+
+
+class TranslationRequest(StrictModel):
+    automatic: bool = False
+
+
 def public_url_syntax(value):
     try:
         parts = urlsplit(value.strip())

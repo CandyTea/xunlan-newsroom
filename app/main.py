@@ -21,8 +21,9 @@ from .collector import Collector, fetch_config, fetch_public, rematch_watch, res
 from .browser import browser_cache_url, browser_source_urls, parse_browser_feed
 from .db import Database, utc_now
 from .dns import dns_mode
-from .models import ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, Schedule, Settings, Setup, Source, Watch
+from .models import ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, Schedule, Settings, Setup, Source, TranslationRequest, TranslationSettings, Watch
 from .scheduler import Scheduler, next_run, schedule_from_row
+from .translation import PROVIDERS, TranslationError, Translator, needs_translation
 
 ROOT = Path(__file__).resolve().parent.parent
 COOKIE_NAME = "newsroom_session"
@@ -61,6 +62,8 @@ class BodyLimitMiddleware:
             return
         data = bytearray()
         limit = 4 * 1024 * 1024 if scope["path"] == "/api/browser/import" and scope["method"] == "POST" else 64 * 1024
+        if scope["path"] == "/api/translation/settings" and scope["method"] == "PUT":
+            limit = 256 * 1024
         while True:
             message = await receive()
             if message["type"] == "http.disconnect":
@@ -88,6 +91,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
     db = Database(Path(data_dir or os.getenv("NEWSROOM_DATA_DIR", ROOT / "data")) / "newsroom.sqlite3")
     db.initialize()
     collector = Collector(db, fetcher)
+    translator = Translator(db)
     browser_urls = browser_source_urls()
     scheduler = Scheduler(db, collector)
     setup_token = os.getenv("SETUP_TOKEN", "")
@@ -104,8 +108,9 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         yield
         await scheduler.stop()
         await collector.stop()
+        await translator.stop()
 
-    app = FastAPI(title="Newsroom", version="1.1.7", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.2.0", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -127,6 +132,10 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         errors = exc.errors()
         fields = ", ".join(".".join(map(str, error["loc"][1:])) for error in errors[:3])
         return JSONResponse({"detail": f"输入参数无效：{fields or '请求内容'}。请检查格式、长度及必填项"}, status_code=422)
+
+    @app.exception_handler(TranslationError)
+    async def translation_error(request, exc):
+        return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=exc.status)
 
     def existing_session(request):
         token = request.cookies.get(COOKIE_NAME, "")
@@ -229,12 +238,14 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         value["enabled"] = bool(value["enabled"])
         return value
 
-    def article_from_row(conn, row):
+    def article_from_row(conn, row, translation_config=None):
         value = dict(row)
         value.pop("canonical_url", None)
         value.pop("source_id", None)
         value["saved"] = bool(value["saved"])
         value["read"] = bool(value["read"])
+        value["translation"] = translator.cached(conn, row, translation_config)
+        value["needs_translation"] = needs_translation(row)
         value["watches"] = [dict(hit) for hit in conn.execute("""SELECT w.id,w.name,w.type FROM watches w
                               JOIN article_watches h ON h.watch_id=w.id WHERE h.article_id=? ORDER BY w.id""", (value["id"],))]
         return value
@@ -323,7 +334,21 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
 
     @app.get("/api/preferences", dependencies=[Depends(require_auth)])
     def preferences():
-        return {"timezone": db.settings()["timezone"]}
+        return {"timezone": db.settings()["timezone"], "translation": translator.reader_preferences()}
+
+    @app.get("/api/translation/settings", dependencies=[Depends(require_auth)])
+    def translation_settings():
+        return translator.public_settings()
+
+    @app.put("/api/translation/settings", dependencies=[Depends(require_auth)])
+    def save_translation_settings(body: TranslationSettings):
+        return translator.save_settings(body)
+
+    @app.get("/api/translation/models", dependencies=[Depends(require_auth)])
+    async def translation_models(provider: str = Query(..., max_length=40)):
+        if provider not in PROVIDERS:
+            raise HTTPException(422, "翻译供应商无效")
+        return {"models": await translator.models(provider)}
 
     @app.get("/api/articles", dependencies=[Depends(require_auth)])
     def articles(category: str = "", q: str = Query("", max_length=200), following: bool = False,
@@ -375,17 +400,24 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             conditions.append("EXISTS(SELECT 1 FROM article_watches h WHERE h.article_id=a.id AND h.watch_id=?)")
             params.append(company_id)
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        translation_config = translator.snapshot()
         with db.connection() as conn:
             total = conn.execute("SELECT COUNT(*) FROM articles a" + where, params).fetchone()[0]
             rows = conn.execute("SELECT a.* FROM articles a" + where + " ORDER BY COALESCE(published_at,fetched_at) DESC,id DESC LIMIT ? OFFSET ?",
                                 [*params, page_size, (page - 1) * page_size]).fetchall()
-            items = [article_from_row(conn, row) for row in rows]
+            items = [article_from_row(conn, row, translation_config) for row in rows]
         return {"items": items, "total": total, "page": page, "page_size": page_size}
 
     @app.get("/api/articles/{article_id}", dependencies=[Depends(require_auth)])
     def article(article_id: int):
         with db.connection() as conn:
             return article_from_row(conn, ensure_row(conn, "articles", article_id))
+
+    @app.post("/api/articles/{article_id}/translate", dependencies=[Depends(require_auth)])
+    async def translate_article(article_id: int, body: TranslationRequest):
+        with db.connection() as conn:
+            value = dict(ensure_row(conn, "articles", article_id))
+        return {"translation": await translator.translate(value, automatic=body.automatic)}
 
     @app.patch("/api/articles/{article_id}", dependencies=[Depends(require_auth)])
     def patch_article(article_id: int, body: ArticlePatch):

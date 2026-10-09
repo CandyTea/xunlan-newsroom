@@ -137,6 +137,16 @@ class Database:
                     scheduled_at TEXT NOT NULL, run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
                     PRIMARY KEY(schedule_id,scheduled_at));
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS translation_settings (
+                    id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS translation_providers (
+                    id TEXT PRIMARY KEY, protocol TEXT NOT NULL, base_url TEXT NOT NULL,
+                    model TEXT NOT NULL, encrypted_key TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS article_translations (
+                    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                    fingerprint TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
+                    provider TEXT NOT NULL, model TEXT NOT NULL, translated_at TEXT NOT NULL,
+                    PRIMARY KEY(article_id,fingerprint));
             """)
             watch_columns = {row["name"] for row in conn.execute("PRAGMA table_info(watches)")}
             if "league_id" not in watch_columns:
