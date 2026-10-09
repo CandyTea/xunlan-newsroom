@@ -200,7 +200,7 @@ function statusBox() {
 function runTable(runs) {
   if (!runs.length) return el("p", { class: "inline-empty", text: "尚无收取记录。在阅读室手动收取，或等待已启用的计划。" });
   const names = { running: "进行中", success: "成功", completed: "成功", failed: "失败", partial: "部分成功", error: "失败", interrupted: "已中断" };
-  const triggers = { manual: "手动收取", schedule: "定时计划", scheduled: "定时计划", catch_up: "遗漏补收", catchup: "遗漏补收" };
+  const triggers = { manual: "手动收取", schedule: "定时计划", scheduled: "定时计划", catch_up: "遗漏补收", catchup: "遗漏补收", browser: "当前设备补收" };
   return el("table", { class: "run-table" }, [el("caption", { class: "skip-link", text: "最近收取记录" }), el("thead", {}, el("tr", {}, [el("th", { scope: "col", text: "时间 / 触发" }), el("th", { scope: "col", text: "结果" }), el("th", { scope: "col", text: "新增" })])), el("tbody", {}, runs.map(run => el("tr", {}, [el("td", {}, [el("time", { datetime: run.started_at, text: dateTime(run.started_at) }), el("div", { class: "muted", text: triggers[run.trigger] || run.trigger || "收取" })]), el("td", {}, [el("span", { class: `run-status ${["success", "completed"].includes(run.status) ? "success" : ["failed", "error"].includes(run.status) ? "failed" : run.status === "partial" ? "partial" : ""}`, text: names[run.status] || run.status }), run.error && el("div", { class: "run-error", text: run.error }), run.source_count !== undefined && el("div", { class: "muted", text: `${run.source_count} 个来源` })]), el("td", { text: run.new_count == null ? "—" : `${run.new_count} 条` })])))]);
 }
 async function refreshRuns() { const target = $("#run-history"); if (!target) return; try { const data = await api("/runs?limit=30"); if (target.isConnected) target.replaceChildren(runTable(data.items || [])); } catch (error) { showError(error); } }

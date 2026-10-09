@@ -30,6 +30,8 @@ const state = { session: null, view: "news", category: "", q: "", saved: false, 
 const $ = (selector, root = document) => root.querySelector(selector);
 const main = $("#main-content");
 const modal = $("#modal");
+const deviceNews = { enabled: true, busy: false, lastAttempt: 0, message: "", controller: null, failed: [] };
+try { deviceNews.enabled = localStorage.getItem("xunlan.device-news") !== "off"; } catch { /* Use the default when storage is unavailable. */ }
 
 function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
@@ -71,7 +73,7 @@ async function api(path, options = {}, retry = true) {
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
   if (method !== "GET" && state.session?.csrf_token) headers["X-CSRF-Token"] = state.session.csrf_token;
   let response;
-  try { response = await fetch(`/api${path}`, { method, headers, credentials: "same-origin", body: options.body === undefined ? undefined : JSON.stringify(options.body) }); }
+  try { response = await fetch(`/api${path}`, { method, headers, credentials: "same-origin", signal: options.signal, body: options.body === undefined ? undefined : JSON.stringify(options.body) }); }
   catch { throw new ApiError("无法连接服务器，请检查网络后重试。", 0); }
   let data;
   try { data = await response.json(); } catch { data = {}; }
@@ -146,6 +148,8 @@ async function confirmDelete(title, copy, action) {
 }
 
 function showAuth() {
+  deviceNews.controller?.abort();
+  deviceNews.lastAttempt = 0;
   $("#boot").hidden = true; $("#app").hidden = true; $("#auth").hidden = false;
   const setup = state.session?.setup_required;
   $("#auth-title").textContent = setup ? "建立你的阅读室" : "欢迎回来";
@@ -174,6 +178,61 @@ async function enterApp() {
   await refreshData(); if (!state.session?.authenticated) return;
   restoreFocus();
   route();
+  if (deviceNews.enabled) collectDeviceNews();
+}
+
+function deviceNewsText() {
+  return deviceNews.message || (deviceNews.enabled ? "海外资讯通过当前设备补收，打开网页即可使用。" : "当前设备补收已关闭。");
+}
+function deviceNewsNotice() {
+  return el("p", { class: "device-news-status", "data-device-news-status": true, role: "status", text: deviceNewsText() });
+}
+function updateDeviceNewsStatus() {
+  document.querySelectorAll("[data-device-news-status]").forEach(node => { node.textContent = deviceNewsText(); });
+  updateFetchButtons();
+}
+function setDeviceNewsEnabled(enabled) {
+  deviceNews.enabled = enabled;
+  try { localStorage.setItem("xunlan.device-news", enabled ? "on" : "off"); } catch { /* This choice still applies to the current page. */ }
+  deviceNews.message = "";
+  if (!enabled) deviceNews.controller?.abort();
+  updateDeviceNewsStatus();
+  if (enabled) collectDeviceNews();
+}
+async function collectDeviceNews(categories = Object.keys(CATEGORIES)) {
+  if (deviceNews.busy || !state.session?.authenticated) return [];
+  const session = state.session;
+  const controller = new AbortController();
+  let failed = false;
+  deviceNews.controller = controller; deviceNews.busy = true; deviceNews.lastAttempt = Date.now(); deviceNews.failed = [];
+  deviceNews.message = "正在通过当前设备补收海外资讯…"; updateDeviceNewsStatus();
+  try {
+    const data = await api("/browser/sources", { signal: controller.signal });
+    if (controller.signal.aborted) return [];
+    const sources = data.items.filter(source => categories.includes(source.category));
+    const result = await BrowserNews.collect({
+      sources, signal: controller.signal,
+      importFeed: body => {
+        if (controller.signal.aborted || state.session !== session) throw new Error("当前收取已取消");
+        return api("/browser/import", { method: "POST", body, signal: controller.signal });
+      },
+      onProgress: (done, total) => { deviceNews.message = `当前设备正在补收海外资讯 · ${done}/${total}`; updateDeviceNewsStatus(); },
+    });
+    if (controller.signal.aborted) return [];
+    deviceNews.failed = result.failed;
+    deviceNews.message = sources.length ? `当前设备补收 ${result.sourceIds.length}/${sources.length} 个来源，新增 ${result.newCount} 条${result.failed.length ? `；暂时失败：${result.failed.map(item => item.name).join("、")}` : ""}` : "当前栏目没有启用可通过设备补收的预置海外来源。";
+    await refreshData();
+    if (["news", "following"].includes(state.view) && !state.manageWatches && !modal.open) await renderView();
+    return result.sourceIds;
+  } catch (error) {
+    failed = !controller.signal.aborted;
+    controller.abort();
+    if (state.session?.authenticated) deviceNews.message = `当前设备补收未完成：${error.message}`;
+    return [];
+  } finally {
+    if (controller.signal.aborted && !failed) deviceNews.message = deviceNews.enabled ? "当前设备补收已停止，可重新收取。" : "当前设备补收已关闭。";
+    deviceNews.busy = false; deviceNews.controller = null; updateDeviceNewsStatus();
+  }
 }
 function route() {
   const next = location.hash.slice(1); state.view = ["news", "following", "schedules", "settings"].includes(next) ? next : "news";
@@ -285,7 +344,7 @@ async function renderReader(id) {
     tools.append(watchSelect);
   }
   const list = el("div", { id: "reader-list", "aria-live": "polite" }, loading("正在载入资讯…"));
-  main.replaceChildren(head, following && !state.watches.length ? el("div", { class: "following-intro" }, [el("p", {}, [el("strong", { text: "还没有关注对象" }), " · 添加关注后，相关资讯会出现在这里。"]), button("添加", () => watchForm(), "button button-small", "plus")]) : "", categories, !following && focusBar(), tools, list);
+  main.replaceChildren(head, deviceNewsNotice(), following && !state.watches.length ? el("div", { class: "following-intro" }, [el("p", {}, [el("strong", { text: "还没有关注对象" }), " · 添加关注后，相关资讯会出现在这里。"]), button("添加", () => watchForm(), "button button-small", "plus")]) : "", categories, !following && focusBar(), tools, list);
   try {
     const params = new URLSearchParams({ page: String(state.page), page_size: String(state.pageSize), following: String(following), saved: String(state.saved), unread: String(state.unread) });
     if (state.category) params.set("category", state.category); if (state.q) params.set("q", state.q); if (state.watchId) params.set("watch_id", state.watchId);
@@ -421,9 +480,18 @@ function renderSettings() {
     el("dl", { class: "reading-preferences" }, [el("dt", { text: "收取时区" }), el("dd", { text: state.settings.timezone }), el("dt", { text: "资讯排序" }), el("dd", { text: "按来源发布时间，由新到旧" }), el("dt", { text: "公司焦点" }), el("dd", { text: "在当前浏览器记住你的公司、联赛与球队选择" })]),
     el("p", { class: "field-caption", text: "打开资讯会标为已读；收藏可用于稍后阅读。摘要来自公开来源，完整报道请前往原文。" })
   ]);
-  main.replaceChildren(heading("设置", "让阅读更适合你的节奏。"), account, preferences);
+  const device = el("section", { class: "settings-section reader-settings" }, [
+    el("div", { class: "section-heading" }, el("h2", { text: "海外资讯" })),
+    el("label", { class: "checkbox-label" }, [input("device_news", "on", { type: "checkbox", checked: deviceNews.enabled, onchange: event => setDeviceNewsEnabled(event.target.checked) }), "通过当前设备补收海外资讯"]),
+    el("p", { class: "field-caption", text: "手机和电脑直接打开网页即可。页面可见时自动补收，也可以手动收取。ESPN 优先直连，其他预置海外 RSS 使用 rss2json、AllOrigins 公开转接；转接只接收公开订阅地址，不发送账号或关注词条，可能缓存或暂时失败。" }),
+    el("p", { class: "field-caption", text: "补收的新闻保存到现有阅读室，沿用公司、联赛和球队筛选。关闭网页后，固定时间的收取继续由服务器执行，设备补收暂停。此开关仅在当前浏览器保存。" }),
+    deviceNewsNotice(),
+    button("重新补收", () => collectDeviceNews(), "button button-small", "refresh", { "data-device-fetch-button": true, disabled: deviceNews.busy }),
+  ]);
+  main.replaceChildren(heading("设置", "让阅读更适合你的节奏。"), account, preferences, device);
 }
 async function logout() {
+  deviceNews.controller?.abort();
   try { await api("/logout", { method: "POST", body: {} }); state.session = await api("/session"); state.renderId += 1; closeModal(); $("#auth-password").value = ""; showAuth(); toast("已退出登录"); }
   catch (error) { showError(error); }
 }
@@ -437,19 +505,26 @@ function renderSidebar() {
   $("#sidebar").replaceChildren(runtime, watches, note);
 }
 function updateFetchButtons() {
-  const busy = Boolean(state.status.fetching || state.fetching);
+  const busy = Boolean(state.status.fetching || state.fetching || deviceNews.busy);
   $("#header-fetch").disabled = busy; $("#header-fetch").setAttribute("aria-label", busy ? "正在收取资讯" : "收取资讯");
   const span = $("#header-fetch span:last-child"); if (span) span.textContent = busy ? "正在收取…" : "收取资讯";
   document.querySelectorAll("[data-fetch-button]").forEach(node => { node.disabled = busy; });
+  document.querySelectorAll("[data-device-fetch-button]").forEach(node => { node.disabled = deviceNews.busy; });
 }
 function requestFetch() {
-  if (state.status.fetching || state.fetching) { toast("资讯正在收取，请稍候。"); return; }
-  const form = el("form", { class: "modal-form" }, [el("p", { class: "field-caption", text: "从已启用的来源收取最新资讯。收取将在后台进行，你可以继续阅读。" }), el("fieldset", {}, [el("legend", { text: "选择收取栏目" }), choices("categories", CATEGORIES, state.category ? [state.category] : Object.keys(CATEGORIES))]), formFooter("开始收取")]);
+  if (state.status.fetching || state.fetching || deviceNews.busy) { toast("资讯正在收取，请稍候。"); return; }
+  const form = el("form", { class: "modal-form" }, [el("p", { class: "field-caption", text: "从已启用的来源收取最新资讯。通过当前设备补收时，请保持网页打开；你可以继续阅读。" }), el("fieldset", {}, [el("legend", { text: "选择收取栏目" }), choices("categories", CATEGORIES, state.category ? [state.category] : Object.keys(CATEGORIES))]), check("device_news", "通过当前设备补收海外资讯", deviceNews.enabled), formFooter("开始收取")]);
   form.addEventListener("submit", async event => {
     event.preventDefault(); const categories = new FormData(form).getAll("categories"); if (!categories.length) { modalError(form, new Error("请至少选择一个栏目。")); return; }
-    const submit = $("[type=submit]", form); submit.disabled = true; state.fetching = true; updateFetchButtons();
-    try { const result = await api("/fetch", { method: "POST", body: { categories } }); closeModal(); toast(result.message || "已开始收取，完成后资讯会自动更新"); state.status.fetching = true; renderSidebar(); await pollStatus(); }
-    catch (error) { if (error.status !== 401) modalError(form, error); } finally { state.fetching = false; updateFetchButtons(); submit.disabled = false; }
+    const useDevice = new FormData(form).has("device_news");
+    const session = state.session;
+    const submit = $("[type=submit]", form); submit.disabled = true; state.fetching = true; closeModal(); updateFetchButtons();
+    try {
+      const skip_source_ids = useDevice ? await collectDeviceNews(categories) : [];
+      if (state.session !== session || !state.session?.authenticated) return;
+      const result = await api("/fetch", { method: "POST", body: { categories, skip_source_ids } });
+      toast(result.message || "已开始收取，完成后资讯会自动更新"); state.status.fetching = true; renderSidebar(); await pollStatus();
+    } catch (error) { showError(error); } finally { state.fetching = false; updateFetchButtons(); submit.disabled = false; }
   }); openModal("收取资讯", form);
 }
 async function pollStatus() {
@@ -457,11 +532,13 @@ async function pollStatus() {
   state.pollBusy = true;
   try {
     const wasFetching = Boolean(state.status.fetching); state.status = await api("/status"); renderSidebar(); updateFetchButtons();
+    if (!wasFetching && state.status.fetching && deviceNews.enabled && !state.fetching && Date.now() - deviceNews.lastAttempt > 60000) collectDeviceNews();
     if (wasFetching && !state.status.fetching) {
       const result = state.status.last_run;
       toast(result?.status === "partial" ? "收取完成，部分来源暂时失败；已收取的资讯可正常阅读" : result?.status === "failed" ? "本次收取失败，请稍后重试" : result?.status === "interrupted" ? "收取已中断，可重新收取" : "收取已完成");
       if (["news", "following"].includes(state.view) && !state.manageWatches) renderView();
     }
+    if (deviceNews.enabled && !deviceNews.busy && !state.fetching && Date.now() - deviceNews.lastAttempt >= 15 * 60000) collectDeviceNews();
   } catch (error) { if (error.status === 401) showAuth(); } finally { state.pollBusy = false; }
 }
 

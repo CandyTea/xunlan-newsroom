@@ -390,7 +390,7 @@ class Collector:
     def fetching(self):
         return self.task is not None and not self.task.done()
 
-    async def start(self, categories, trigger="manual", slots=None, failed_only=False):
+    async def start(self, categories, trigger="manual", slots=None, failed_only=False, skip_source_ids=()):
         async with self.lock:
             if self.fetching:
                 return False, self.run_id
@@ -414,7 +414,7 @@ class Collector:
                     conn.execute("UPDATE schedule_slots SET run_id=? WHERE schedule_id=? AND scheduled_at=?", (run_id, slot["id"], slot["scheduled_at"]))
                     conn.execute("UPDATE schedules SET last_run_at=? WHERE id=?", (now, slot["id"]))
             self.run_id = run_id
-            self.task = asyncio.create_task(self.collect(run_id, categories, failed_only=failed_only))
+            self.task = asyncio.create_task(self.collect(run_id, categories, failed_only=failed_only, skip_source_ids=skip_source_ids))
             return True, run_id
 
     def persist_articles(self, source, articles):
@@ -441,13 +441,14 @@ class Collector:
             conn.execute("UPDATE sources SET last_success_at=?,last_error=NULL WHERE id=?", (utc_now(), source["id"]))
         return count
 
-    async def collect(self, run_id, categories, *, failed_only=False):
+    async def collect(self, run_id, categories, *, failed_only=False, skip_source_ids=()):
         new_count = 0
         errors = []
         attempted = 0
         try:
             with self.db.connection() as conn:
-                sources = [dict(row) for row in conn.execute("SELECT * FROM sources WHERE enabled=1") if row["category"] in categories]
+                sources = [dict(row) for row in conn.execute("SELECT * FROM sources WHERE enabled=1")
+                           if row["category"] in categories and row["id"] not in skip_source_ids]
             semaphore = asyncio.Semaphore(3)
 
             async def check_source(source):

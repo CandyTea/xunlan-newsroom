@@ -5,6 +5,7 @@ import os
 import secrets
 import threading
 import time
+import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -17,9 +18,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .collector import Collector, fetch_config, fetch_public, rematch_watch, resolve_public_url, watch_from_row
+from .browser import browser_source_urls, parse_browser_feed
 from .db import Database, utc_now
 from .dns import dns_mode
-from .models import ArticlePatch, CATEGORIES, Credentials, FetchRequest, Schedule, Settings, Setup, Source, Watch
+from .models import ArticlePatch, BrowserFeed, CATEGORIES, Credentials, FetchRequest, Schedule, Settings, Setup, Source, Watch
 from .scheduler import Scheduler, next_run, schedule_from_row
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -58,13 +60,14 @@ class BodyLimitMiddleware:
             await self.app(scope, receive, send)
             return
         data = bytearray()
+        limit = 4 * 1024 * 1024 if scope["path"] == "/api/browser/import" and scope["method"] == "POST" else 64 * 1024
         while True:
             message = await receive()
             if message["type"] == "http.disconnect":
                 return
             data.extend(message.get("body", b""))
-            if len(data) > 64 * 1024:
-                await JSONResponse({"detail": "请求内容超过 64 KB 上限"}, status_code=413)(scope, receive, send)
+            if len(data) > limit:
+                await JSONResponse({"detail": "请求内容超过大小上限"}, status_code=413)(scope, receive, send)
                 return
             if not message.get("more_body", False):
                 break
@@ -85,6 +88,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
     db = Database(Path(data_dir or os.getenv("NEWSROOM_DATA_DIR", ROOT / "data")) / "newsroom.sqlite3")
     db.initialize()
     collector = Collector(db, fetcher)
+    browser_urls = browser_source_urls()
     scheduler = Scheduler(db, collector)
     setup_token = os.getenv("SETUP_TOKEN", "")
     secure_cookie = os.getenv("COOKIE_SECURE", "0").lower() in ("1", "true", "yes")
@@ -101,7 +105,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await scheduler.stop()
         await collector.stop()
 
-    app = FastAPI(title="Newsroom", version="1.1.4", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.1.5", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -113,7 +117,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; connect-src 'self' https://www.espn.com https://api.rss2json.com https://api.allorigins.win; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         if request.url.path.startswith("/api/") or request.url.path in ("/", "/admin"):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -513,8 +517,43 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
     async def fetch(body: FetchRequest, request: Request, session=Depends(require_auth)):
         if body.failed_only:
             require_admin(request, session)
-        accepted, run_id = await collector.start(body.categories, failed_only=body.failed_only)
+        options = {"failed_only": body.failed_only}
+        if body.skip_source_ids:
+            options["skip_source_ids"] = body.skip_source_ids
+        accepted, run_id = await collector.start(body.categories, **options)
         return {"accepted": accepted, "run_id": run_id, "message": "采集已启动" if accepted else "已有采集正在进行，未重复启动"}
+
+    @app.get("/api/browser/sources", dependencies=[Depends(require_auth)])
+    def browser_sources():
+        with db.connection() as conn:
+            items = [{key: row[key] for key in ("id", "name", "url", "category")}
+                     for row in conn.execute("SELECT * FROM sources WHERE enabled=1 AND kind='rss' ORDER BY id")
+                     if row["url"] in browser_urls]
+        return {"items": items}
+
+    @app.post("/api/browser/import", dependencies=[Depends(require_auth)])
+    def browser_import(body: BrowserFeed):
+        with db.connection() as conn:
+            row = ensure_row(conn, "sources", body.source_id)
+            if not row["enabled"] or row["kind"] != "rss" or row["url"] != body.source_url or row["url"] not in browser_urls:
+                raise HTTPException(409, "此来源已停用或地址改变，未保存客户端数据")
+            source = dict(row)
+        try:
+            articles = parse_browser_feed(body.content, body.format, source["url"])
+        except (ValueError, UnicodeError, ET.ParseError) as exc:
+            raise HTTPException(422, "客户端取得的内容不是有效的资讯订阅") from exc
+        with db.lock:
+            with db.connection() as conn:
+                row = ensure_row(conn, "sources", body.source_id)
+                if not row["enabled"] or row["kind"] != "rss" or row["url"] != body.source_url:
+                    raise HTTPException(409, "此来源已停用或地址改变，未保存客户端数据")
+                source = dict(row)
+            new_count = collector.persist_articles(source, articles)
+            with db.connection(write=True) as conn:
+                now = utc_now()
+                conn.execute("INSERT INTO metadata(key,value) VALUES('last_success_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now,))
+                conn.execute("INSERT INTO runs(trigger,started_at,finished_at,status,new_count,source_count) VALUES('browser',?,?,'success',?,1)", (now, now, new_count))
+        return {"source_id": body.source_id, "new_count": new_count, "item_count": len(articles)}
 
     @app.get("/api/network", dependencies=[Depends(require_admin)])
     def network():
@@ -534,7 +573,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             following_count = conn.execute("SELECT COUNT(DISTINCT article_id) FROM article_watches").fetchone()[0]
             source_count = conn.execute("SELECT COUNT(*) FROM sources WHERE enabled=1").fetchone()[0]
             success = conn.execute("SELECT value FROM metadata WHERE key='last_success_at'").fetchone()
-            last_run = conn.execute("SELECT status,new_count,source_count FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+            last_run = conn.execute("SELECT status,new_count,source_count FROM runs WHERE trigger!='browser' ORDER BY id DESC LIMIT 1").fetchone()
         future = [value["next_run_at"] for value in schedules_list() if value["next_run_at"]]
         return {"fetching": collector.fetching, "last_success_at": success[0] if success else None,
                 "next_run_at": min(future) if future else None, "article_count": article_count,

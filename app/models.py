@@ -130,6 +130,14 @@ class Settings(StrictModel):
 class FetchRequest(StrictModel):
     categories: list[Category] = Field(default_factory=lambda: list(CATEGORIES), min_length=1, max_length=4)
     failed_only: bool = False
+    skip_source_ids: list[int] = Field(default_factory=list, max_length=100)
+
+
+class BrowserFeed(StrictModel):
+    source_id: int = Field(gt=0)
+    source_url: str = Field(min_length=1, max_length=2048)
+    format: Literal["rss", "rss2json"]
+    content: str = Field(max_length=2 * 1024 * 1024)
 
 
 class ArticlePatch(StrictModel):
