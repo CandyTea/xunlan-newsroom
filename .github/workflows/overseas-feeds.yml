@@ -1,0 +1,66 @@
+name: Overseas news cache
+
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/overseas-feeds.yml'
+      - 'app/feed_cache.py'
+      - 'app/browser.py'
+      - 'app/default_sources.json'
+      - 'requirements.txt'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: overseas-news-cache
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install collector dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Read existing public cache
+        shell: bash
+        run: |
+          if git ls-remote --exit-code --heads origin news-cache; then
+            git fetch origin news-cache:refs/remotes/origin/news-cache
+          fi
+      - name: Collect public RSS
+        id: feeds
+        continue-on-error: true
+        run: python -m app.feed_cache --output work/feed-cache/public-feeds
+      - name: Publish public cache
+        if: ${{ !cancelled() && steps.feeds.outcome != 'skipped' }}
+        shell: bash
+        run: |
+          test -f work/feed-cache/public-feeds/manifest.json
+          if git show-ref --verify --quiet refs/remotes/origin/news-cache; then
+            git switch --create news-cache --track origin/news-cache
+          else
+            git switch --orphan news-cache
+          fi
+          mkdir -p public-feeds
+          cp work/feed-cache/public-feeds/*.json public-feeds/
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add public-feeds
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update public overseas RSS cache'
+            git push origin HEAD:news-cache
+          fi
+      - name: Report collection failure
+        if: ${{ steps.feeds.outcome == 'failure' }}
+        run: exit 1
+
