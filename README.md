@@ -1,4 +1,4 @@
-# 讯览（Newsroom）v1.1.3
+# 讯览（Newsroom）v1.1.4
 
 讯览是一款单用户、自托管的新闻阅读器。它按游戏、体育、股票和国际新闻分类汇总来源，支持关注词条、收藏、已读状态与定时抓取。视觉方向以财新现有识别度为灵感。
 
@@ -80,15 +80,21 @@ Steam 环世界（App ID `294100`）和只狼（App ID `814380`）是可选示�
 
 修改 `.env` 后，按当前部署方式重新运行 `docker compose ... up -d --build`，让环境变量进入容器。仅执行 `restart` 不会更新容器里的环境变量。自动切换不会创建代理，也不能替代服务器可用的网络出口。
 
-## Windows 本地预览
+## Windows 本地使用
 
-需要 Python 3.11。项目依赖安装在本地 `.venv\Lib\site-packages`；启动脚本忽略 pip 环境变量和用户配置，并显式指定安装目录，避免写入全局 target：
+电脑本地使用时，采集、数据库和阅读网站都运行在这台电脑上，不连接腾讯云同步新闻。电脑能连通新闻源，才可以收取对应来源；关闭程序或电脑休眠后，定时采集暂停。首次本地使用需创建本地账号，与腾讯云上的账号和数据相互独立。
+
+需要先安装 Python 3.11。下载项目 ZIP 并解压后，双击 `start-local.cmd`，启动完成会自动打开浏览器。也可以在 PowerShell 中执行下列命令。项目依赖安装在本地 `.venv\Lib\site-packages`；启动脚本忽略 pip 环境变量和用户配置，并显式指定安装目录，避免写入全局 target：
 
 ```powershell
 .\run-local.ps1
 ```
 
-打开 `http://127.0.0.1:8000`；管理入口为 `http://127.0.0.1:8000/admin`。若希望手动启动，可在 PowerShell 中运行：
+浏览器地址为 `http://127.0.0.1:8000`；管理入口为 `http://127.0.0.1:8000/admin`。`run-local.ps1 -NoBrowser` 可关闭自动打开浏览器。保持启动窗口运行，关闭窗口会停止本地采集和网站。
+
+本地启动会优先保留显式的 `NEWSROOM_OUTBOUND_PROXY`，否则读取 Python 可识别的本机 HTTP(S) 代理配置（环境变量或 Windows 系统静态代理）。这一自动检测只在本地启动入口生效，腾讯云部署不会自动读取主机代理。浏览器插件、PAC 自动代理规则和仅有 SOCKS 的配置不能据此保证识别；可给本地程序设置实际可用的 HTTP(S) 代理地址，或使用能供程序直连的本机网络。无需把代理设置交给腾讯云。
+
+若希望手动启动，可在 PowerShell 中运行：
 
 ```powershell
 py -3.11 -m venv .venv
@@ -96,7 +102,7 @@ py -3.11 -m venv .venv
 $env:NEWSROOM_DATA_DIR = "$PWD\data"
 $env:TZ = "Asia/Shanghai"
 $env:COOKIE_SECURE = "0"
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+.\.venv\Scripts\python.exe -m app.local
 ```
 
 应用内的定时调度器使用单进程运行；本地和 Docker 命令都固定为一个 Uvicorn worker。不要把 `--workers` 调大，否则多个 worker 会各自启动调度器。

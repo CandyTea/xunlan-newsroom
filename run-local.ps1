@@ -1,3 +1,5 @@
+﻿param([switch]$NoBrowser)
+
 $ErrorActionPreference = "Stop"
 
 $projectDir = $PSScriptRoot
@@ -36,7 +38,9 @@ $env:SETUP_TOKEN = ""
 
 Push-Location $projectDir
 try {
-    & $pythonExe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+    $localArgs = @("-m", "app.local")
+    if ($NoBrowser) { $localArgs += "--no-browser" }
+    & $pythonExe @localArgs
     if ($LASTEXITCODE -ne 0) {
         throw "讯览进程退出，检查上方日志。"
     }
