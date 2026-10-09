@@ -21,14 +21,16 @@ from .collector import Collector, fetch_config, fetch_public, rematch_watch, res
 from .browser import browser_cache_url, browser_source_urls, parse_browser_feed
 from .content import ArticleReader, ContentError
 from .db import Database, utc_now
+from .guests import GuestReaders
 from .dns import dns_mode
-from .models import ArticleHtml, ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, Schedule, Settings, Setup, Source, TranslationRequest, TranslationSettings, Watch
+from .models import ArticleHtml, ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, ReadingPreferences, Schedule, Settings, Setup, Source, TranslationRequest, TranslationSettings, Watch
 from .scheduler import Scheduler, next_run, schedule_from_row
 from .translation import PROVIDERS, TranslationError, Translator, needs_translation
 
 ROOT = Path(__file__).resolve().parent.parent
 COOKIE_NAME = "newsroom_session"
 ADMIN_COOKIE_NAME = "newsroom_admin"
+GUEST_COOKIE_NAME = "newsroom_guest"
 
 
 def password_hash(password):
@@ -96,6 +98,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
     collector = Collector(db, fetcher)
     translator = Translator(db)
     reader = ArticleReader(db)
+    guests = GuestReaders(db)
     browser_urls = browser_source_urls()
     scheduler = Scheduler(db, collector)
     setup_token = os.getenv("SETUP_TOKEN", "")
@@ -114,8 +117,9 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await collector.stop()
         await translator.stop()
         await reader.stop()
+        await guests.stop()
 
-    app = FastAPI(title="Newsroom", version="1.3.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.4.0", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -155,11 +159,42 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
                                 WHERE token_hash=? AND expires_at>?""", (token_hash(token), utc_now())).fetchone()
         return dict(row) if row else None
 
+    def existing_guest(request):
+        token = request.cookies.get(GUEST_COOKIE_NAME, "")
+        if not token or len(token) > 128:
+            return None
+        with db.connection() as conn:
+            row = conn.execute("SELECT * FROM guest_sessions WHERE token_hash=? AND expires_at>?",
+                               (token_hash(token), utc_now())).fetchone()
+        return {**dict(row), "guest": True} if row else None
+
+    def reader_id(session):
+        return session["token_hash"] if session.get("guest") else "owner"
+
+    def reading_services(session, article=None):
+        if not session.get("guest"):
+            return db, translator, reader
+        services = guests.get(reader_id(session))
+        if article is not None:
+            services.db.ensure_article(article)
+        return services.db, services.translator, services.reader
+
+    def reader_timezone(session):
+        if session.get("guest"):
+            with db.connection() as conn:
+                row = conn.execute("SELECT timezone FROM guest_preferences WHERE reader_id=?", (reader_id(session),)).fetchone()
+            if row:
+                return row["timezone"]
+        return db.settings()["timezone"]
+
     def session_shape(session=None):
         with db.connection() as conn:
             setup_required = conn.execute("SELECT 1 FROM users").fetchone() is None
-        return {"authenticated": session is not None, "setup_required": setup_required,
-                "username": session["username"] if session else None,
+        guest = bool(session and session.get("guest"))
+        return {"authenticated": session is not None and not guest, "guest": guest,
+                "can_read": session is not None, "setup_required": setup_required,
+                "reader_key": "guest:" + session["token_hash"][:16] if guest else None,
+                "username": session.get("username") if session else None,
                 "csrf_token": session["csrf_token"] if session else None,
                 "setup_token_required": bool(setup_token) and setup_required}
 
@@ -170,6 +205,16 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             csrf = request.headers.get("X-CSRF-Token", "")
             if not hmac.compare_digest(csrf, session["csrf_token"]):
+                raise HTTPException(403, "安全令牌无效，请刷新页面后重试")
+            require_same_origin(request)
+        return session
+
+    def require_reader(request: Request):
+        session = existing_session(request) or existing_guest(request)
+        if session is None:
+            raise HTTPException(401, "阅读会话已过期，请重新打开游客模式或登录")
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            if not hmac.compare_digest(request.headers.get("X-CSRF-Token", ""), session["csrf_token"]):
                 raise HTTPException(403, "安全令牌无效，请刷新页面后重试")
             require_same_origin(request)
         return session
@@ -236,10 +281,19 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             failures.clear()
         return user["username"]
 
-    def ensure_row(conn, table, row_id):
-        row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone()
+    def ensure_row(conn, table, row_id, scope=None):
+        if scope is None:
+            row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone()
+        else:
+            row = conn.execute(f"SELECT * FROM {table} WHERE id=? AND reader_id=?", (row_id, scope)).fetchone()
         if row is None:
             raise HTTPException(404, "未找到该记录")
+        return row
+
+    def visible_article(conn, article_id, session):
+        row = ensure_row(conn, "articles", article_id)
+        if row["reader_id"] not in ("public", reader_id(session)):
+            raise HTTPException(404, "未找到该资讯")
         return row
 
     def source_from_row(row):
@@ -247,25 +301,36 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         value["enabled"] = bool(value["enabled"])
         return value
 
-    def article_from_row(conn, row, translation_config=None):
+    def article_from_row(conn, row, session, translation_config=None):
         value = dict(row)
         value.pop("canonical_url", None)
         value.pop("source_id", None)
+        value.pop("reader_id", None)
+        if session.get("guest"):
+            flags = conn.execute("SELECT saved,read FROM guest_article_state WHERE reader_id=? AND article_id=?",
+                                 (reader_id(session), value["id"])).fetchone()
+            value["saved"], value["read"] = (flags["saved"], flags["read"]) if flags else (0, 0)
         value["saved"] = bool(value["saved"])
         value["read"] = bool(value["read"])
-        value["translation"] = translator.cached(conn, row, translation_config)
+        cache_db, scoped_translator, _ = reading_services(session)
+        if cache_db is db:
+            value["translation"] = scoped_translator.cached(conn, row, translation_config)
+        else:
+            with cache_db.connection() as cache_conn:
+                value["translation"] = scoped_translator.cached(cache_conn, row, translation_config)
         value["needs_translation"] = needs_translation(row)
         value["watches"] = [dict(hit) for hit in conn.execute("""SELECT w.id,w.name,w.type FROM watches w
-                              JOIN article_watches h ON h.watch_id=w.id WHERE h.article_id=? ORDER BY w.id""", (value["id"],))]
+                              JOIN article_watches h ON h.watch_id=w.id WHERE h.article_id=? AND w.reader_id=? ORDER BY w.id""", (value["id"], reader_id(session)))]
         return value
 
-    def schedules_list():
+    def schedules_list(scope="owner"):
         now = datetime.now(timezone.utc)
         zone = db.settings()["timezone"]
         with db.connection() as conn:
-            values = [schedule_from_row(row) for row in conn.execute("SELECT * FROM schedules ORDER BY time,id")]
+            values = [schedule_from_row(row) for row in conn.execute("SELECT * FROM schedules WHERE reader_id=? ORDER BY time,id", (scope,))]
         for value in values:
-            value["next_run_at"] = next_run(value, now, zone)
+            value["next_run_at"] = next_run(value, now, value.pop("timezone", "") or zone)
+            value.pop("reader_id", None)
         return values
 
     @app.get("/healthz")
@@ -276,7 +341,25 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
 
     @app.get("/api/session")
     def session(request: Request):
-        return session_shape(existing_session(request))
+        return session_shape(existing_session(request) or existing_guest(request))
+
+    @app.post("/api/guest")
+    def enter_guest(request: Request, response: Response):
+        require_same_origin(request)
+        current = existing_session(request) or existing_guest(request)
+        if current:
+            return session_shape(current)
+        token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+        expires = datetime.now(timezone.utc) + timedelta(days=365)
+        guest = {"token_hash": token_hash(token), "csrf_token": csrf, "expires_at": expires.isoformat(), "guest": True}
+        with db.connection(write=True) as conn:
+            conn.execute("INSERT INTO guest_sessions(token_hash,csrf_token,expires_at) VALUES(?,?,?)",
+                         (guest["token_hash"], csrf, guest["expires_at"]))
+            conn.execute("INSERT INTO guest_preferences(reader_id,timezone) VALUES(?,?)",
+                         (guest["token_hash"], db.settings()["timezone"]))
+        response.set_cookie(GUEST_COOKIE_NAME, token, max_age=365 * 86400, httponly=True,
+                            secure=secure_cookie, samesite="strict", path="/")
+        return session_shape(guest)
 
     @app.post("/api/setup")
     def setup(body: Setup, request: Request, response: Response):
@@ -337,36 +420,52 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         clear_admin_cookie(response)
         return {"authenticated": False, "expires_at": None}
 
-    @app.get("/api/catalog", dependencies=[Depends(require_auth)])
+    @app.get("/api/catalog", dependencies=[Depends(require_reader)])
     def catalog():
         return db.catalog
 
-    @app.get("/api/preferences", dependencies=[Depends(require_auth)])
-    def preferences():
-        return {"timezone": db.settings()["timezone"], "translation": translator.reader_preferences()}
+    @app.get("/api/preferences")
+    def preferences(session=Depends(require_reader)):
+        _, scoped_translator, _ = reading_services(session)
+        return {"timezone": reader_timezone(session), "translation": scoped_translator.reader_preferences()}
 
-    @app.get("/api/translation/settings", dependencies=[Depends(require_auth)])
-    def translation_settings():
-        return translator.public_settings()
+    @app.put("/api/preferences")
+    def save_preferences(body: ReadingPreferences, session=Depends(require_reader)):
+        if not session.get("guest"):
+            raise HTTPException(403, "站点时区需要管理员权限")
+        with db.connection(write=True) as conn:
+            conn.execute("UPDATE guest_preferences SET timezone=? WHERE reader_id=?", (body.timezone, reader_id(session)))
+            conn.execute("UPDATE schedules SET timezone=?,created_at=? WHERE reader_id=?",
+                         (body.timezone, utc_now(), reader_id(session)))
+        scheduler.notify()
+        return preferences(session)
 
-    @app.put("/api/translation/settings", dependencies=[Depends(require_auth)])
-    def save_translation_settings(body: TranslationSettings):
-        return translator.save_settings(body)
+    @app.get("/api/translation/settings")
+    def translation_settings(session=Depends(require_reader)):
+        return reading_services(session)[1].public_settings()
 
-    @app.get("/api/translation/models", dependencies=[Depends(require_auth)])
-    async def translation_models(provider: str = Query(..., max_length=40)):
+    @app.put("/api/translation/settings")
+    def save_translation_settings(body: TranslationSettings, session=Depends(require_reader)):
+        return reading_services(session)[1].save_settings(body)
+
+    @app.get("/api/translation/models")
+    async def translation_models(provider: str = Query(..., max_length=40), session=Depends(require_reader)):
         if provider not in PROVIDERS:
             raise HTTPException(422, "翻译供应商无效")
-        return {"models": await translator.models(provider)}
+        return {"models": await reading_services(session)[1].models(provider)}
 
-    @app.get("/api/articles", dependencies=[Depends(require_auth)])
+    @app.get("/api/articles")
     def articles(category: str = "", q: str = Query("", max_length=200), following: bool = False,
                  saved: bool = False, unread: bool = False, watch_id: int | None = Query(None, gt=0),
                  company_id: int | None = Query(None, gt=0), league_id: str = Query("", max_length=80),
                  team_id: str = Query("", max_length=80),
-                 page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
-        conditions = []
-        params = []
+                 page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), session=Depends(require_reader)):
+        conditions = ["(a.reader_id='public' OR a.reader_id=?)"]
+        params = [reader_id(session)]
+        scope = reader_id(session)
+        guest = bool(session.get("guest"))
+        joins = " LEFT JOIN guest_article_state g ON g.article_id=a.id AND g.reader_id=?" if guest else ""
+        join_params = [scope] if guest else []
         if category:
             if category not in CATEGORIES:
                 raise HTTPException(422, "新闻分类无效")
@@ -377,12 +476,15 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             conditions.append("(a.title LIKE ? ESCAPE '\\' OR a.summary LIKE ? ESCAPE '\\')")
             params.extend([query, query])
         if following:
-            conditions.append("EXISTS(SELECT 1 FROM article_watches h WHERE h.article_id=a.id)")
+            conditions.append("EXISTS(SELECT 1 FROM article_watches h JOIN watches w ON w.id=h.watch_id WHERE h.article_id=a.id AND w.reader_id=?)")
+            params.append(scope)
         if saved:
-            conditions.append("a.saved=1")
+            conditions.append("COALESCE(g.saved,0)=1" if guest else "a.saved=1")
         if unread:
-            conditions.append("a.read=0")
+            conditions.append("COALESCE(g.read,0)=0" if guest else "a.read=0")
         if watch_id:
+            with db.connection() as conn:
+                ensure_row(conn, "watches", watch_id, scope)
             conditions.append("EXISTS(SELECT 1 FROM article_watches h WHERE h.article_id=a.id AND h.watch_id=?)")
             params.append(watch_id)
         leagues = {league["id"] for league in db.catalog["leagues"]}
@@ -396,81 +498,91 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         if league_id:
             conditions.append("""(EXISTS(SELECT 1 FROM article_topics t WHERE t.article_id=a.id AND t.topic_id=?) OR
                 (a.category='sports' AND EXISTS(SELECT 1 FROM article_watches h JOIN watches w ON w.id=h.watch_id
-                 WHERE h.article_id=a.id AND w.type='team' AND w.enabled=1 AND w.league_id=?)))""")
-            params.extend(["league:" + league_id, league_id])
+                 WHERE h.article_id=a.id AND w.type='team' AND w.enabled=1 AND w.league_id=? AND w.reader_id=?)))""")
+            params.extend(["league:" + league_id, league_id, scope])
         if team_id:
             conditions.append("EXISTS(SELECT 1 FROM article_topics t WHERE t.article_id=a.id AND t.topic_id=?)")
             params.append("team:" + team_id)
         if company_id:
             with db.connection() as conn:
-                company = ensure_row(conn, "watches", company_id)
+                company = ensure_row(conn, "watches", company_id, scope)
                 if company["type"] != "company" or not company["enabled"]:
                     raise HTTPException(422, "公司筛选必须选择已启用的公司关注")
             conditions.append("EXISTS(SELECT 1 FROM article_watches h WHERE h.article_id=a.id AND h.watch_id=?)")
             params.append(company_id)
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
-        translation_config = translator.snapshot()
+        translation_config = reading_services(session)[1].snapshot()
         with db.connection() as conn:
-            total = conn.execute("SELECT COUNT(*) FROM articles a" + where, params).fetchone()[0]
-            rows = conn.execute("SELECT a.* FROM articles a" + where + " ORDER BY COALESCE(published_at,fetched_at) DESC,id DESC LIMIT ? OFFSET ?",
-                                [*params, page_size, (page - 1) * page_size]).fetchall()
-            items = [article_from_row(conn, row, translation_config) for row in rows]
+            total = conn.execute("SELECT COUNT(*) FROM articles a" + joins + where, [*join_params, *params]).fetchone()[0]
+            rows = conn.execute("SELECT a.* FROM articles a" + joins + where + " ORDER BY COALESCE(a.published_at,a.fetched_at) DESC,a.id DESC LIMIT ? OFFSET ?",
+                                [*join_params, *params, page_size, (page - 1) * page_size]).fetchall()
+            items = [article_from_row(conn, row, session, translation_config) for row in rows]
         return {"items": items, "total": total, "page": page, "page_size": page_size}
 
-    @app.get("/api/articles/{article_id}", dependencies=[Depends(require_auth)])
-    def article(article_id: int):
+    @app.get("/api/articles/{article_id}")
+    def article(article_id: int, session=Depends(require_reader)):
         with db.connection() as conn:
-            value = article_from_row(conn, ensure_row(conn, "articles", article_id))
-            value.update(content_result(conn, value))
-            return value
+            value = article_from_row(conn, visible_article(conn, article_id, session), session)
+        value.update(content_result(value, session))
+        return value
 
-    def content_result(conn, value):
-        content = reader.cached(conn, value)
-        return {"content": content, "body_translation": translator.cached_body(conn, value, content["paragraphs"]) if content else None}
+    def content_result(value, session):
+        cache_db, scoped_translator, scoped_reader = reading_services(session, value)
+        with cache_db.connection() as conn:
+            content = scoped_reader.cached(conn, value)
+            translation = scoped_translator.cached_body(conn, value, content["paragraphs"]) if content else None
+        return {"content": content, "body_translation": translation}
 
-    @app.post("/api/articles/{article_id}/content", dependencies=[Depends(require_auth)])
-    async def article_content(article_id: int):
+    @app.post("/api/articles/{article_id}/content")
+    async def article_content(article_id: int, session=Depends(require_reader)):
         with db.connection() as conn:
-            value = dict(ensure_row(conn, "articles", article_id))
-        await reader.read(value)
-        with db.connection() as conn:
-            return content_result(conn, value)
+            value = dict(visible_article(conn, article_id, session))
+        await reading_services(session, value)[2].read(value)
+        return content_result(value, session)
 
-    @app.post("/api/articles/{article_id}/content/import", dependencies=[Depends(require_auth)])
-    async def import_article_content(article_id: int, body: ArticleHtml):
+    @app.post("/api/articles/{article_id}/content/import")
+    async def import_article_content(article_id: int, body: ArticleHtml, session=Depends(require_reader)):
         with db.connection() as conn:
-            value = dict(ensure_row(conn, "articles", article_id))
-        await reader.import_html(value, body.article_url, body.html)
-        with db.connection() as conn:
-            return content_result(conn, value)
+            value = dict(visible_article(conn, article_id, session))
+        await reading_services(session, value)[2].import_html(value, body.article_url, body.html)
+        return content_result(value, session)
 
-    @app.post("/api/articles/{article_id}/translate", dependencies=[Depends(require_auth)])
-    async def translate_article(article_id: int, body: TranslationRequest):
+    @app.post("/api/articles/{article_id}/translate")
+    async def translate_article(article_id: int, body: TranslationRequest, session=Depends(require_reader)):
         with db.connection() as conn:
-            value = dict(ensure_row(conn, "articles", article_id))
-            content = reader.cached(conn, value) if body.scope == "body" else None
+            value = dict(visible_article(conn, article_id, session))
+        cache_db, scoped_translator, scoped_reader = reading_services(session, value)
         if body.scope == "body":
+            with cache_db.connection() as conn:
+                content = scoped_reader.cached(conn, value)
             if content is None:
                 raise HTTPException(409, "请先载入新闻正文，再点击翻译。")
-            return {"translation": await translator.translate_body(value, content["paragraphs"])}
-        return {"translation": await translator.translate(value, automatic=body.automatic)}
+            return {"translation": await scoped_translator.translate_body(value, content["paragraphs"])}
+        return {"translation": await scoped_translator.translate(value, automatic=body.automatic)}
 
-    @app.patch("/api/articles/{article_id}", dependencies=[Depends(require_auth)])
-    def patch_article(article_id: int, body: ArticlePatch):
+    @app.patch("/api/articles/{article_id}")
+    def patch_article(article_id: int, body: ArticlePatch, session=Depends(require_reader)):
         with db.connection(write=True) as conn:
-            ensure_row(conn, "articles", article_id)
+            visible_article(conn, article_id, session)
+            if session.get("guest"):
+                conn.execute("INSERT OR IGNORE INTO guest_article_state(reader_id,article_id) VALUES(?,?)",
+                             (reader_id(session), article_id))
             for key in ("saved", "read"):
                 value = getattr(body, key)
                 if value is not None:
-                    conn.execute(f"UPDATE articles SET {key}=? WHERE id=?", (int(value), article_id))
-            return article_from_row(conn, ensure_row(conn, "articles", article_id))
+                    if session.get("guest"):
+                        conn.execute(f"UPDATE guest_article_state SET {key}=? WHERE article_id=? AND reader_id=?",
+                                     (int(value), article_id, reader_id(session)))
+                    else:
+                        conn.execute(f"UPDATE articles SET {key}=? WHERE id=?", (int(value), article_id))
+            return article_from_row(conn, visible_article(conn, article_id, session), session)
 
-    @app.get("/api/watches", dependencies=[Depends(require_auth)])
-    def watches():
+    @app.get("/api/watches")
+    def watches(session=Depends(require_reader)):
         with db.connection() as conn:
-            return {"items": [watch_from_row(row) for row in conn.execute("SELECT * FROM watches ORDER BY id")]}
+            return {"items": [watch_from_row(row) for row in conn.execute("SELECT * FROM watches WHERE reader_id=? ORDER BY id", (reader_id(session),))]}
 
-    def write_watch(body, watch_id=None):
+    def write_watch(body, session, watch_id=None):
         if body.league_id and body.league_id not in {league["id"] for league in db.catalog["leagues"]}:
             raise HTTPException(422, "所属联赛选项无效")
         value = body.model_dump()
@@ -479,25 +591,25 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         value["enabled"] = int(value["enabled"])
         with db.connection(write=True) as conn:
             if watch_id is None:
-                watch_id = conn.execute("INSERT INTO watches(type,name,aliases,keywords,exclude_keywords,enabled,market,ticker,league_id) VALUES(?,?,?,?,?,?,?,?,?)", tuple(value.values())).lastrowid
+                watch_id = conn.execute("INSERT INTO watches(type,name,aliases,keywords,exclude_keywords,enabled,market,ticker,league_id,reader_id) VALUES(?,?,?,?,?,?,?,?,?,?)", (*value.values(), reader_id(session))).lastrowid
             else:
-                ensure_row(conn, "watches", watch_id)
+                ensure_row(conn, "watches", watch_id, reader_id(session))
                 conn.execute("UPDATE watches SET type=?,name=?,aliases=?,keywords=?,exclude_keywords=?,enabled=?,market=?,ticker=?,league_id=? WHERE id=?", (*value.values(), watch_id))
             rematch_watch(conn, watch_id, db.catalog)
-            return watch_from_row(ensure_row(conn, "watches", watch_id))
+            return watch_from_row(ensure_row(conn, "watches", watch_id, reader_id(session)))
 
-    @app.post("/api/watches", dependencies=[Depends(require_auth)])
-    def add_watch(body: Watch):
-        return write_watch(body)
+    @app.post("/api/watches")
+    def add_watch(body: Watch, session=Depends(require_reader)):
+        return write_watch(body, session)
 
-    @app.put("/api/watches/{watch_id}", dependencies=[Depends(require_auth)])
-    def edit_watch(watch_id: int, body: Watch):
-        return write_watch(body, watch_id)
+    @app.put("/api/watches/{watch_id}")
+    def edit_watch(watch_id: int, body: Watch, session=Depends(require_reader)):
+        return write_watch(body, session, watch_id)
 
-    @app.delete("/api/watches/{watch_id}", dependencies=[Depends(require_auth)])
-    def delete_watch(watch_id: int):
+    @app.delete("/api/watches/{watch_id}")
+    def delete_watch(watch_id: int, session=Depends(require_reader)):
         with db.connection(write=True) as conn:
-            ensure_row(conn, "watches", watch_id)
+            ensure_row(conn, "watches", watch_id, reader_id(session))
             conn.execute("DELETE FROM watches WHERE id=?", (watch_id,))
         return {"ok": True}
 
@@ -535,36 +647,36 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             conn.execute("DELETE FROM sources WHERE id=?", (source_id,))
         return {"ok": True}
 
-    @app.get("/api/schedules", dependencies=[Depends(require_auth)])
-    def schedules():
-        return {"items": schedules_list()}
+    @app.get("/api/schedules")
+    def schedules(session=Depends(require_reader)):
+        return {"items": schedules_list(reader_id(session))}
 
-    def write_schedule(body, schedule_id=None):
+    def write_schedule(body, session, schedule_id=None):
         values = (body.name, body.time, json.dumps(body.days), json.dumps(body.categories), int(body.enabled))
         with db.connection(write=True) as conn:
             if schedule_id is None:
-                schedule_id = conn.execute("INSERT INTO schedules(name,time,days,categories,enabled,created_at) VALUES(?,?,?,?,?,?)", (*values, utc_now())).lastrowid
+                schedule_id = conn.execute("INSERT INTO schedules(name,time,days,categories,enabled,created_at,reader_id,timezone) VALUES(?,?,?,?,?,?,?,?)", (*values, utc_now(), reader_id(session), reader_timezone(session) if session.get("guest") else "")).lastrowid
             else:
-                old = ensure_row(conn, "schedules", schedule_id)
+                old = ensure_row(conn, "schedules", schedule_id, reader_id(session))
                 conn.execute("UPDATE schedules SET name=?,time=?,days=?,categories=?,enabled=? WHERE id=?", (*values, schedule_id))
                 if any(old[key] != value for key, value in zip(("time", "days", "categories", "enabled"), values[1:])):
                     # A newly configured time starts from this edit; it does not retroactively run.
                     conn.execute("UPDATE schedules SET created_at=? WHERE id=?", (utc_now(), schedule_id))
         scheduler.notify()
-        return next(value for value in schedules_list() if value["id"] == schedule_id)
+        return next(value for value in schedules_list(reader_id(session)) if value["id"] == schedule_id)
 
-    @app.post("/api/schedules", dependencies=[Depends(require_auth)])
-    def add_schedule(body: Schedule):
-        return write_schedule(body)
+    @app.post("/api/schedules")
+    def add_schedule(body: Schedule, session=Depends(require_reader)):
+        return write_schedule(body, session)
 
-    @app.put("/api/schedules/{schedule_id}", dependencies=[Depends(require_auth)])
-    def edit_schedule(schedule_id: int, body: Schedule):
-        return write_schedule(body, schedule_id)
+    @app.put("/api/schedules/{schedule_id}")
+    def edit_schedule(schedule_id: int, body: Schedule, session=Depends(require_reader)):
+        return write_schedule(body, session, schedule_id)
 
-    @app.delete("/api/schedules/{schedule_id}", dependencies=[Depends(require_auth)])
-    def delete_schedule(schedule_id: int):
+    @app.delete("/api/schedules/{schedule_id}")
+    def delete_schedule(schedule_id: int, session=Depends(require_reader)):
         with db.connection(write=True) as conn:
-            ensure_row(conn, "schedules", schedule_id)
+            ensure_row(conn, "schedules", schedule_id, reader_id(session))
             conn.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
         scheduler.notify()
         return {"ok": True}
@@ -582,16 +694,16 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         return value
 
     @app.post("/api/fetch")
-    async def fetch(body: FetchRequest, request: Request, session=Depends(require_auth)):
+    async def fetch(body: FetchRequest, request: Request, session=Depends(require_reader)):
         if body.failed_only:
-            require_admin(request, session)
+            require_admin(request, require_auth(request))
         options = {"failed_only": body.failed_only}
         if body.skip_source_ids:
             options["skip_source_ids"] = body.skip_source_ids
         accepted, run_id = await collector.start(body.categories, **options)
         return {"accepted": accepted, "run_id": run_id, "message": "采集已启动" if accepted else "已有采集正在进行，未重复启动"}
 
-    @app.get("/api/browser/sources", dependencies=[Depends(require_auth)])
+    @app.get("/api/browser/sources", dependencies=[Depends(require_reader)])
     def browser_sources():
         with db.connection() as conn:
             items = [{**{key: row[key] for key in ("id", "name", "url", "category")}, "cache_url": browser_cache_url(row["url"])}
@@ -599,8 +711,8 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
                      if row["url"] in browser_urls]
         return {"items": items}
 
-    @app.post("/api/browser/import", dependencies=[Depends(require_auth)])
-    def browser_import(body: BrowserFeed):
+    @app.post("/api/browser/import")
+    def browser_import(body: BrowserFeed, session=Depends(require_reader)):
         with db.connection() as conn:
             row = ensure_row(conn, "sources", body.source_id)
             if not row["enabled"] or row["kind"] != "rss" or row["url"] != body.source_url or row["url"] not in browser_urls:
@@ -616,15 +728,19 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
                 if not row["enabled"] or row["kind"] != "rss" or row["url"] != body.source_url:
                     raise HTTPException(409, "此来源已停用或地址改变，未保存客户端数据")
                 source = dict(row)
-            new_count = collector.persist_articles(source, articles)
+            new_count = collector.persist_articles(source, articles, reader_id(session) if session.get("guest") else "public")
+            if session.get("guest"):
+                return {"source_id": body.source_id, "new_count": new_count, "item_count": len(articles)}
             with db.connection(write=True) as conn:
                 now = utc_now()
                 conn.execute("INSERT INTO metadata(key,value) VALUES('last_success_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now,))
                 conn.execute("INSERT INTO runs(trigger,started_at,finished_at,status,new_count,source_count) VALUES('browser',?,?,'success',?,1)", (now, now, new_count))
         return {"source_id": body.source_id, "new_count": new_count, "item_count": len(articles)}
 
-    @app.post("/api/browser/report", dependencies=[Depends(require_auth)])
-    def browser_report(body: BrowserReport):
+    @app.post("/api/browser/report")
+    def browser_report(body: BrowserReport, session=Depends(require_reader)):
+        if session.get("guest"):
+            return {"recorded": False}
         errors = []
         with db.connection(write=True) as conn:
             for failure in body.failures:
@@ -646,26 +762,31 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         with db.connection() as conn:
             return {"items": [dict(row) for row in conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,))]}
 
-    @app.get("/api/status", dependencies=[Depends(require_auth)])
-    def status():
+    @app.get("/api/status")
+    def status(session=Depends(require_reader)):
         with db.connection() as conn:
-            article_count = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-            unread_count = conn.execute("SELECT COUNT(*) FROM articles WHERE read=0").fetchone()[0]
-            following_count = conn.execute("SELECT COUNT(DISTINCT article_id) FROM article_watches").fetchone()[0]
+            article_count = conn.execute("SELECT COUNT(*) FROM articles WHERE reader_id='public' OR reader_id=?", (reader_id(session),)).fetchone()[0]
+            if session.get("guest"):
+                unread_count = conn.execute("""SELECT COUNT(*) FROM articles a LEFT JOIN guest_article_state g
+                    ON g.article_id=a.id AND g.reader_id=? WHERE COALESCE(g.read,0)=0 AND (a.reader_id='public' OR a.reader_id=?)""", (reader_id(session), reader_id(session))).fetchone()[0]
+            else:
+                unread_count = conn.execute("SELECT COUNT(*) FROM articles WHERE read=0 AND reader_id='public'").fetchone()[0]
+            following_count = conn.execute("""SELECT COUNT(DISTINCT h.article_id) FROM article_watches h
+                JOIN watches w ON w.id=h.watch_id WHERE w.reader_id=?""", (reader_id(session),)).fetchone()[0]
             source_count = conn.execute("SELECT COUNT(*) FROM sources WHERE enabled=1").fetchone()[0]
             success = conn.execute("SELECT value FROM metadata WHERE key='last_success_at'").fetchone()
             last_run = conn.execute("SELECT status,new_count,source_count FROM runs WHERE trigger!='browser' ORDER BY id DESC LIMIT 1").fetchone()
-        future = [value["next_run_at"] for value in schedules_list() if value["next_run_at"]]
+        future = [value["next_run_at"] for value in schedules_list(reader_id(session)) if value["next_run_at"]]
         return {"fetching": collector.fetching, "last_success_at": success[0] if success else None,
                 "next_run_at": min(future) if future else None, "article_count": article_count,
                 "unread_count": unread_count, "following_count": following_count, "source_count": source_count,
                 "last_run": dict(last_run) if last_run else None, "last_error": None}
 
     @app.get("/api/export", dependencies=[Depends(require_admin)])
-    def export():
+    def export(session=Depends(require_auth)):
         with db.connection() as conn:
             return {"settings": db.settings(), "sources": [source_from_row(row) for row in conn.execute("SELECT * FROM sources ORDER BY id")],
-                    "watches": [watch_from_row(row) for row in conn.execute("SELECT * FROM watches ORDER BY id")], "schedules": schedules_list()}
+                    "watches": [watch_from_row(row) for row in conn.execute("SELECT * FROM watches WHERE reader_id=? ORDER BY id", (reader_id(session),))], "schedules": schedules_list()}
 
     static = ROOT / "app" / "static"
     if static.exists():

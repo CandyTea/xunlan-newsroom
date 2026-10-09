@@ -57,6 +57,30 @@ def seed_default_sources(conn):
     conn.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('sources_seeded','1')")
 
 
+READING_SCHEMA = """
+                CREATE TABLE IF NOT EXISTS translation_settings (
+                    id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS translation_providers (
+                    id TEXT PRIMARY KEY, protocol TEXT NOT NULL, base_url TEXT NOT NULL,
+                    model TEXT NOT NULL, encrypted_key TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS article_translations (
+                    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                    fingerprint TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
+                    provider TEXT NOT NULL, model TEXT NOT NULL, translated_at TEXT NOT NULL,
+                    PRIMARY KEY(article_id,fingerprint));
+                CREATE TABLE IF NOT EXISTS article_content (
+                    article_id INTEGER PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+                    source_url TEXT NOT NULL, paragraphs TEXT NOT NULL, author TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS article_content_translations (
+                    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                    fingerprint TEXT NOT NULL, part INTEGER NOT NULL,
+                    title TEXT NOT NULL, paragraphs TEXT NOT NULL,
+                    provider TEXT NOT NULL, model TEXT NOT NULL, translated_at TEXT NOT NULL,
+                    PRIMARY KEY(article_id,fingerprint,part));
+"""
+
+
 class Database:
     def __init__(self, path):
         self.path = Path(path)
@@ -137,27 +161,32 @@ class Database:
                     scheduled_at TEXT NOT NULL, run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
                     PRIMARY KEY(schedule_id,scheduled_at));
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS translation_settings (
-                    id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS translation_providers (
-                    id TEXT PRIMARY KEY, protocol TEXT NOT NULL, base_url TEXT NOT NULL,
-                    model TEXT NOT NULL, encrypted_key TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS article_translations (
-                    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
-                    fingerprint TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
-                    provider TEXT NOT NULL, model TEXT NOT NULL, translated_at TEXT NOT NULL,
-                    PRIMARY KEY(article_id,fingerprint));
-                CREATE TABLE IF NOT EXISTS article_content (
-                    article_id INTEGER PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
-                    source_url TEXT NOT NULL, paragraphs TEXT NOT NULL, author TEXT NOT NULL,
-                    fetched_at TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS article_content_translations (
-                    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
-                    fingerprint TEXT NOT NULL, part INTEGER NOT NULL,
-                    title TEXT NOT NULL, paragraphs TEXT NOT NULL,
-                    provider TEXT NOT NULL, model TEXT NOT NULL, translated_at TEXT NOT NULL,
-                    PRIMARY KEY(article_id,fingerprint,part));
             """)
+            conn.executescript(READING_SCHEMA)
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS guest_sessions (
+                    token_hash TEXT PRIMARY KEY, csrf_token TEXT NOT NULL, expires_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS guest_preferences (
+                    reader_id TEXT PRIMARY KEY REFERENCES guest_sessions(token_hash) ON DELETE CASCADE,
+                    timezone TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS guest_article_state (
+                    reader_id TEXT NOT NULL REFERENCES guest_sessions(token_hash) ON DELETE CASCADE,
+                    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                    saved INTEGER NOT NULL DEFAULT 0, read INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(reader_id,article_id));
+            """)
+            for table in ("watches", "schedules"):
+                columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if "reader_id" not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN reader_id TEXT NOT NULL DEFAULT 'owner'")
+                conn.execute(f"CREATE INDEX IF NOT EXISTS {table}_reader ON {table}(reader_id,id)")
+            article_columns = {row["name"] for row in conn.execute("PRAGMA table_info(articles)")}
+            if "reader_id" not in article_columns:
+                conn.execute("ALTER TABLE articles ADD COLUMN reader_id TEXT NOT NULL DEFAULT 'public'")
+            conn.execute("CREATE INDEX IF NOT EXISTS articles_reader ON articles(reader_id,id)")
+            schedule_columns = {row["name"] for row in conn.execute("PRAGMA table_info(schedules)")}
+            if "timezone" not in schedule_columns:
+                conn.execute("ALTER TABLE schedules ADD COLUMN timezone TEXT NOT NULL DEFAULT ''")
             watch_columns = {row["name"] for row in conn.execute("PRAGMA table_info(watches)")}
             if "league_id" not in watch_columns:
                 conn.execute("ALTER TABLE watches ADD COLUMN league_id TEXT NOT NULL DEFAULT ''")

@@ -114,6 +114,7 @@ def matches_watch(article, watch, catalog=None):
 
 def watch_from_row(row):
     watch = dict(row)
+    watch.pop("reader_id", None)
     watch["enabled"] = bool(watch["enabled"])
     for key in ("aliases", "keywords", "exclude_keywords"):
         watch[key] = json.loads(watch[key])
@@ -127,7 +128,8 @@ def rematch_watch(conn, watch_id, catalog=None):
     watch = watch_from_row(row)
     conn.execute("DELETE FROM article_watches WHERE watch_id=?", (watch_id,))
     if watch["enabled"]:
-        for article in conn.execute("SELECT id,title,summary,category FROM articles"):
+        for article in conn.execute("SELECT id,title,summary,category FROM articles WHERE reader_id='public' OR reader_id=?",
+                                    (row["reader_id"],)):
             if matches_watch(dict(article), watch, catalog):
                 conn.execute("INSERT INTO article_watches(article_id,watch_id) VALUES(?,?)", (article["id"], watch_id))
 
@@ -417,19 +419,25 @@ class Collector:
             self.task = asyncio.create_task(self.collect(run_id, categories, failed_only=failed_only, skip_source_ids=skip_source_ids))
             return True, run_id
 
-    def persist_articles(self, source, articles):
+    def persist_articles(self, source, articles, reader_id="public"):
         count = 0
         with self.db.connection(write=True) as conn:
             current = conn.execute("SELECT enabled FROM sources WHERE id=?", (source["id"],)).fetchone()
             if current is None or not current["enabled"]:
                 return 0
-            watches = [watch_from_row(row) for row in conn.execute("SELECT * FROM watches WHERE enabled=1")]
+            watches = [watch_from_row(row) for row in conn.execute(
+                "SELECT * FROM watches WHERE enabled=1 AND (?='public' OR reader_id=?)", (reader_id, reader_id))]
             for article in articles:
                 article = {**article, "category": source["category"]}
+                canonical = article["canonical_url"]
+                if reader_id != "public":
+                    if conn.execute("SELECT 1 FROM articles WHERE canonical_url=? AND reader_id='public'", (canonical,)).fetchone():
+                        continue
+                    canonical = reader_id + ":" + canonical
                 inserted = conn.execute("""INSERT OR IGNORE INTO articles(canonical_url,title,url,summary,source_id,
-                    source_name,category,published_at,fetched_at,image_url) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (article["canonical_url"], article["title"], article["url"], article["summary"], source["id"],
-                     source["name"], source["category"], article["published_at"], utc_now(), article["image_url"]))
+                    source_name,category,published_at,fetched_at,image_url,reader_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (canonical, article["title"], article["url"], article["summary"], source["id"],
+                     source["name"], source["category"], article["published_at"], utc_now(), article["image_url"], reader_id))
                 if not inserted.rowcount:
                     continue
                 count += 1
@@ -438,7 +446,8 @@ class Collector:
                 for watch in watches:
                     if matches_watch(article, watch, self.db.catalog):
                         conn.execute("INSERT INTO article_watches(article_id,watch_id) VALUES(?,?)", (inserted.lastrowid, watch["id"]))
-            conn.execute("UPDATE sources SET last_success_at=?,last_error=NULL WHERE id=?", (utc_now(), source["id"]))
+            if reader_id == "public":
+                conn.execute("UPDATE sources SET last_success_at=?,last_error=NULL WHERE id=?", (utc_now(), source["id"]))
         return count
 
     async def collect(self, run_id, categories, *, failed_only=False, skip_source_ids=()):

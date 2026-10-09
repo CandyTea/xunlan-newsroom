@@ -53,10 +53,12 @@ def due_slots(db, since, now, startup=False):
     start = floor if startup else max(since, floor)
     due = []
     with db.connection() as conn:
-        for row in conn.execute("SELECT * FROM schedules WHERE enabled=1"):
+        for row in conn.execute("""SELECT * FROM schedules WHERE enabled=1 AND
+                (reader_id='owner' OR EXISTS(SELECT 1 FROM guest_sessions g
+                 WHERE g.token_hash=schedules.reader_id AND g.expires_at>?))""", (now.isoformat(),)):
             schedule = schedule_from_row(row)
             created_at = datetime.fromisoformat(row["created_at"])
-            candidates = slots_between(schedule, max(start, created_at), now, settings["timezone"])
+            candidates = slots_between(schedule, max(start, created_at), now, row["timezone"] or settings["timezone"])
             # Restart/long pause coalesces to the most recent configured slot.
             if candidates:
                 slot = candidates[-1].isoformat()

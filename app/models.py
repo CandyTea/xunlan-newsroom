@@ -127,6 +127,15 @@ class Settings(StrictModel):
         return value
 
 
+class ReadingPreferences(StrictModel):
+    timezone: str = Field(min_length=1, max_length=80)
+
+    @field_validator("timezone")
+    @classmethod
+    def known_timezone(cls, value):
+        return Settings.known_timezone(value)
+
+
 class FetchRequest(StrictModel):
     categories: list[Category] = Field(default_factory=lambda: list(CATEGORIES), min_length=1, max_length=4)
     failed_only: bool = False

@@ -34,6 +34,8 @@ const deviceNews = { busy: false, lastAttempt: 0, controller: null, pending: nul
 const listTranslation = { controller: null, retryAfter: 0 };
 let articleContentController = null;
 
+function canRead() { return Boolean(state.session?.authenticated || state.session?.guest); }
+
 function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs)) {
@@ -69,6 +71,7 @@ function toast(message) {
 }
 class ApiError extends Error { constructor(message, status, code = "") { super(message); this.status = status; this.code = code; } }
 async function api(path, options = {}, retry = true) {
+  const requestSession = state.session;
   const method = options.method || "GET";
   const headers = { Accept: "application/json" };
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
@@ -78,14 +81,22 @@ async function api(path, options = {}, retry = true) {
   catch { throw new ApiError("无法连接服务器，请检查网络后重试。", 0); }
   let data;
   try { data = await response.json(); } catch { data = {}; }
+  if (requestSession !== state.session && !["/session", "/login", "/setup", "/guest", "/logout"].includes(path)) {
+    throw new ApiError("阅读身份已切换。", 0, "reader_changed");
+  }
   if (!response.ok) {
     if (response.status === 401 && path !== "/login") {
       state.renderId += 1; state.session = { authenticated: false, setup_required: false }; closeModal(); showAuth();
-      throw new ApiError("登录已过期，请重新登录。", 401);
+      throw new ApiError("阅读会话已过期，请重新进入游客模式或登录。", 401);
     }
     if (response.status === 403 && retry && method !== "GET" && !["/setup", "/login"].includes(path)) {
       const fresh = await api("/session", {}, false);
-      if (fresh.authenticated && fresh.csrf_token !== state.session?.csrf_token) { state.session = fresh; return api(path, options, false); }
+      if ((fresh.authenticated || fresh.guest) && fresh.csrf_token !== state.session?.csrf_token) {
+        const changed = fresh.guest !== state.session?.guest || fresh.username !== state.session?.username || fresh.reader_key !== state.session?.reader_key;
+        state.session = fresh;
+        if (changed) { await enterApp(); throw new ApiError("阅读身份已切换，请重新操作。", 0, "reader_changed"); }
+        return api(path, options, false);
+      }
     }
     let detail = data.detail;
     if (Array.isArray(detail)) detail = detail.map(item => item.msg || "请检查输入内容").join("；");
@@ -93,7 +104,7 @@ async function api(path, options = {}, retry = true) {
   }
   return data;
 }
-function showError(error) { if (error.status !== 401) toast(error.message || "操作失败，请稍后重试。"); }
+function showError(error) { if (error.status !== 401 && error.code !== "reader_changed") toast(error.message || "操作失败，请稍后重试。"); }
 function dateTime(value, options = {}) {
   if (!value) return "尚无记录";
   const date = new Date(value); if (Number.isNaN(date.getTime())) return "时间未知";
@@ -167,8 +178,9 @@ function showAuth() {
   if (state.session?.username) $("#auth-username").value = state.session.username;
 }
 async function refreshData() {
+  const session = state.session;
   const results = await Promise.allSettled([api("/preferences"), api("/watches"), api("/status"), api("/catalog")]);
-  if (!state.session?.authenticated) return;
+  if (!canRead() || state.session !== session) return;
   if (results[0].status === "fulfilled") state.settings = results[0].value;
   if (results[1].status === "fulfilled") state.watches = results[1].value.items || [];
   if (results[2].status === "fulfilled") state.status = results[2].value;
@@ -177,8 +189,13 @@ async function refreshData() {
   renderSidebar(); updateFetchButtons();
 }
 async function enterApp() {
+  deviceNews.controller?.abort(); listTranslation.controller?.abort(); closeModal();
+  state.renderId += 1; state.articles = []; state.watches = []; state.schedules = []; state.status = {};
+  state.settings = { timezone: "Asia/Shanghai" }; state.total = 0; state.fetching = false;
+  deviceNews.lastAttempt = 0; listTranslation.retryAfter = 0;
+  main.replaceChildren(loading());
   $("#boot").hidden = true; $("#auth").hidden = true; $("#app").hidden = false;
-  await refreshData(); if (!state.session?.authenticated) return;
+  await refreshData(); if (!canRead()) return;
   restoreFocus();
   route();
   collectDeviceNews();
@@ -186,7 +203,7 @@ async function enterApp() {
 
 async function collectDeviceNews(categories = Object.keys(CATEGORIES)) {
   if (deviceNews.busy) return deviceNews.pending;
-  if (!state.session?.authenticated) return [];
+  if (!canRead()) return [];
   const session = state.session;
   const controller = new AbortController();
   deviceNews.controller = controller; deviceNews.busy = true; deviceNews.lastAttempt = Date.now();
@@ -228,7 +245,7 @@ function route() {
   document.title = `${{ news: "新闻", following: "我的关注", schedules: "收取计划", settings: "设置" }[state.view]} · 讯览`;
 }
 async function renderView() {
-  if (!state.session?.authenticated) return;
+  if (!canRead()) return;
   listTranslation.controller?.abort();
   const id = ++state.renderId;
   if (state.view === "news" || state.view === "following") { if (state.manageWatches) return renderWatches(id); return renderReader(id); }
@@ -239,7 +256,7 @@ function setFilter(key, value) {
   if (key === "category" && value !== state.category) { state.companyId = ""; state.leagueId = ""; state.teamId = ""; state.sportsWatchId = ""; }
   state[key] = value; state.page = 1; if (state.view === "news") persistFocus(); renderView();
 }
-function focusStorageKey() { return `xunlan.focus.${encodeURIComponent(state.session?.username || "")}`; }
+function focusStorageKey() { return `xunlan.focus.${encodeURIComponent(state.session?.reader_key || state.session?.username || "")}`; }
 function normalizeFocus() {
   if (!state.watches.some(w => w.type === "company" && w.enabled && String(w.id) === state.companyId)) state.companyId = "";
   if (!state.catalog.leagues.some(l => l.id === state.leagueId)) state.leagueId = "";
@@ -374,14 +391,14 @@ function articleRow(article) {
 async function autoTranslateList(id) {
   const preferences = state.settings.translation;
   if (listTranslation.controller && !listTranslation.controller.signal.aborted) return;
-  if (!state.session?.authenticated || !["news", "following"].includes(state.view) || state.manageWatches) return;
+  if (!canRead() || $("#app").hidden || !["news", "following"].includes(state.view) || state.manageWatches) return;
   if (!preferences?.ready || !preferences.auto_translate_list || document.hidden || Date.now() < listTranslation.retryAfter) return;
   const pending = state.articles.filter(article => article.needs_translation && !article.translation);
   if (!pending.length) return;
   const controller = new AbortController();
   listTranslation.controller = controller;
   const revision = preferences.revision;
-  const active = () => !controller.signal.aborted && state.session?.authenticated && id === state.renderId && state.settings.translation?.revision === revision;
+  const active = () => !controller.signal.aborted && canRead() && id === state.renderId && state.settings.translation?.revision === revision;
   let next = 0;
   let stopped = false;
   async function worker() {
@@ -588,13 +605,27 @@ function scheduleForm(schedule = {}) {
 async function renderSettings(id) {
   const account = el("section", { class: "settings-section reader-settings" }, [
     el("div", { class: "section-heading" }, el("h2", { text: "我的阅读室" })),
-    el("div", { class: "account-row" }, [el("div", {}, [el("strong", { text: state.session.username || "我的账号" }), el("p", { text: "关注对象与收藏会保存在你的阅读室中。" })]), button("退出登录", logout, "button", "logout")])
+    el("div", { class: "account-row" }, [el("div", {}, [el("strong", { text: state.session.guest ? "游客阅读" : state.session.username || "我的账号" }), el("p", { text: state.session.guest ? "关注、收藏、计划和翻译设置属于当前浏览器的游客身份。清除网站 Cookie 后将无法恢复这些设置。" : "关注对象与收藏会保存在你的阅读室中。" })]), state.session.guest ? button("登录账号", () => { closeModal(); state.renderId += 1; showAuth(); }, "button") : button("退出登录", logout, "button", "logout")])
   ]);
   const preferences = el("section", { class: "settings-section reader-settings" }, [
     el("div", { class: "section-heading" }, el("h2", { text: "阅读与收取" })),
     el("dl", { class: "reading-preferences" }, [el("dt", { text: "收取时区" }), el("dd", { text: state.settings.timezone }), el("dt", { text: "资讯排序" }), el("dd", { text: "按来源发布时间，由新到旧" }), el("dt", { text: "公司焦点" }), el("dd", { text: "在当前浏览器记住你的公司、联赛与球队选择" })]),
     el("p", { class: "field-caption", text: "打开资讯会标为已读；收藏可用于稍后阅读。公开页面中可取得的正文会直接在本站显示。" })
   ]);
+  if (state.session.guest) {
+    const timezone = input("timezone", state.settings.timezone, { required: true, maxlength: 80, placeholder: "Asia/Shanghai" });
+    const save = el("button", { type: "submit", class: "button", text: "保存时区" });
+    const form = el("form", { class: "guest-timezone-form" }, [formField("阅读与收取时区", timezone, "使用 IANA 时区名称，如 Asia/Shanghai、Europe/London。"), save]);
+    form.addEventListener("submit", async event => {
+      event.preventDefault(); save.disabled = true;
+      try {
+        await api("/preferences", { method: "PUT", body: { timezone: timezone.value.trim() } });
+        if (id !== state.renderId) return;
+        await refreshData(); toast("游客时区已保存"); renderView();
+      } catch (error) { showError(error); } finally { save.disabled = false; }
+    });
+    preferences.append(form);
+  }
   const translation = el("section", { class: "settings-section translation-settings" }, loading("正在载入翻译设置…"));
   main.replaceChildren(heading("设置", "让阅读更适合你的节奏。"), account, preferences, translation);
   try {
@@ -705,7 +736,7 @@ function translationForm(config, renderId) {
 async function logout() {
   deviceNews.controller?.abort();
   listTranslation.controller?.abort();
-  try { await api("/logout", { method: "POST", body: {} }); state.session = await api("/session"); state.renderId += 1; closeModal(); $("#auth-password").value = ""; showAuth(); toast("已退出登录"); }
+  try { await api("/logout", { method: "POST", body: {} }); state.session = await api("/guest", { method: "POST", body: {} }); $("#auth-password").value = ""; await enterApp(); toast("已退出登录，当前为游客模式"); }
   catch (error) { showError(error); }
 }
 function statusLine(iconName, name, value) { return el("p", { class: "status-line" }, [icon(iconName), el("span", {}, [`${name} · `, el("strong", { text: value })])]); }
@@ -732,14 +763,14 @@ function requestFetch() {
     const submit = $("[type=submit]", form); submit.disabled = true; state.fetching = true; closeModal(); updateFetchButtons();
     try {
       const skip_source_ids = await collectDeviceNews(categories);
-      if (state.session !== session || !state.session?.authenticated) return;
+      if (state.session !== session || !canRead()) return;
       const result = await api("/fetch", { method: "POST", body: { categories, skip_source_ids } });
       toast(result.message || "已开始收取，完成后资讯会自动更新"); state.status.fetching = true; renderSidebar(); await pollStatus();
     } catch (error) { showError(error); } finally { state.fetching = false; updateFetchButtons(); submit.disabled = false; }
   }); openModal("收取资讯", form);
 }
 async function pollStatus() {
-  if (!state.session?.authenticated || state.pollBusy || document.hidden) return;
+  if (!canRead() || $("#app").hidden || state.pollBusy || document.hidden) return;
   state.pollBusy = true;
   try {
     const wasFetching = Boolean(state.status.fetching); state.status = await api("/status"); renderSidebar(); updateFetchButtons();
@@ -756,8 +787,15 @@ $("#modal-close").addEventListener("click", closeModal);
 modal.addEventListener("close", () => { if (!modal.open) { articleContentController?.abort(); articleContentController = null; } });
 modal.addEventListener("click", event => { if (event.target === modal) { const rect = modal.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) closeModal(); } });
 $("#header-fetch").addEventListener("click", requestFetch);
-window.addEventListener("hashchange", () => { if (state.session?.authenticated) route(); });
+window.addEventListener("hashchange", () => { if (canRead() && !$("#app").hidden) route(); });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { pollStatus(); autoTranslateList(state.renderId); } });
+async function enterGuest() {
+  const submit = $("#auth-guest"); submit.disabled = true;
+  try { state.session = await api("/guest", { method: "POST", body: {} }); await enterApp(); }
+  catch (error) { $("#auth-error").textContent = error.message; $("#auth-error").hidden = false; }
+  finally { submit.disabled = false; }
+}
+$("#auth-guest").addEventListener("click", enterGuest);
 $("#auth-form").addEventListener("submit", async event => {
   event.preventDefault(); const submit = $("#auth-submit"); const errorNode = $("#auth-error"); errorNode.hidden = true; submit.disabled = true;
   const body = { username: $("#auth-username").value.trim(), password: $("#auth-password").value };
@@ -768,7 +806,7 @@ $("#auth-form").addEventListener("submit", async event => {
 });
 $("#masthead-date").textContent = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long", day: "numeric", weekday: "long" }).format(new Date());
 (async () => {
-  try { state.session = await api("/session"); if (state.session.authenticated) await enterApp(); else showAuth(); }
+  try { state.session = await api("/session"); if (!canRead()) state.session = await api("/guest", { method: "POST", body: {} }); await enterApp(); }
   catch (error) { $("#boot").replaceChildren(el("span", { class: "brand", text: "讯览·" }), el("p", { text: error.message }), button("重新连接", () => location.reload(), "button", "refresh")); }
 })();
 setInterval(pollStatus, 12000);
