@@ -28,6 +28,8 @@ def default_media_name(source):
         return "The Guardian"
     if host == "t.me" and urlsplit(source["url"]).path.rstrip("/").lower() == "/s/fabrizioromanotg":
         return "罗马诺"
+    if source["kind"] == "dongqiudi":
+        return "懂球帝"
     return source["name"]
 
 
@@ -193,6 +195,15 @@ class Database:
                     reader_id TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
                     source_url TEXT NOT NULL, before_id INTEGER, exhausted INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL, PRIMARY KEY(reader_id,source_id));
+                CREATE TABLE IF NOT EXISTS dongqiudi_articles (
+                    article_id INTEGER PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+                    author TEXT NOT NULL DEFAULT '', complete INTEGER NOT NULL DEFAULT 0);
+                CREATE INDEX IF NOT EXISTS dongqiudi_authors ON dongqiudi_articles(author,article_id);
+                CREATE TABLE IF NOT EXISTS dongqiudi_tags (
+                    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK(kind IN ('team','player')), tag_id TEXT NOT NULL,
+                    name TEXT NOT NULL, PRIMARY KEY(article_id,kind,tag_id));
+                CREATE INDEX IF NOT EXISTS dongqiudi_tag_filter ON dongqiudi_tags(kind,tag_id,article_id);
             """)
             for table in ("sources", "articles"):
                 columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -200,6 +211,7 @@ class Database:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN media_id INTEGER REFERENCES media(id)")
             conn.execute("CREATE INDEX IF NOT EXISTS articles_media ON articles(media_id,id)")
             conn.execute("CREATE INDEX IF NOT EXISTS articles_source_reader ON articles(source_id,reader_id,id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS articles_url_reader ON articles(url,reader_id,id)")
             conn.execute("CREATE INDEX IF NOT EXISTS sources_media ON sources(media_id,enabled)")
             for source in conn.execute("SELECT * FROM sources WHERE media_id IS NULL").fetchall():
                 media_id = ensure_media(conn, default_media_name(source))

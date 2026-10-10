@@ -234,8 +234,9 @@ async def fetch_public(url):
                         # when different hostnames resolve to the same public IP.
                         async with httpx.AsyncClient(timeout=httpx.Timeout(20, connect=10), trust_env=False,
                                                      follow_redirects=False, proxy=routes[attempt % len(routes)]) as client:
+                            user_agent = "Mozilla/5.0" if hostname in ("www.dongqiudi.com", "pc.dongqiudi.com", "m.dongqiudi.com") else "Newsroom/1.0 (personal RSS reader)"
                             async with client.stream("GET", pinned,
-                                                     headers={"Host": host, "User-Agent": "Newsroom/1.0 (personal RSS reader)",
+                                                     headers={"Host": host, "User-Agent": user_agent,
                                                               "Accept": "application/rss+xml,application/atom+xml,application/json,text/xml,*/*"},
                                                      extensions={"sni_hostname": hostname, "trace": tls_identity}) as response:
                                 if response.status_code in (301, 302, 303, 307, 308):
@@ -368,6 +369,9 @@ def parse_source(data, source, base_url=None):
     if source["kind"] == "telegram":
         from .telegram import parse_telegram
         return parse_telegram(data, source["url"])
+    if source["kind"] == "dongqiudi":
+        from .dongqiudi import list_page
+        return list_page(data)[0]
     return parse_rss(data, base_url or source["url"])
 
 
@@ -396,6 +400,8 @@ class Collector:
         self.lock = asyncio.Lock()
         self.task = None
         self.run_id = None
+        self.dqd_lock = asyncio.Lock()
+        self.dqd_refreshed = {}
 
     @property
     def fetching(self):
@@ -431,8 +437,8 @@ class Collector:
     def persist_articles(self, source, articles, reader_id="public"):
         count = 0
         with self.db.connection(write=True) as conn:
-            current = conn.execute("SELECT enabled,media_id FROM sources WHERE id=?", (source["id"],)).fetchone()
-            if current is None or not current["enabled"]:
+            current = conn.execute("SELECT enabled,media_id,kind,url FROM sources WHERE id=?", (source["id"],)).fetchone()
+            if current is None or not current["enabled"] or current["kind"] != source["kind"] or current["url"] != source["url"]:
                 return 0
             watches = [watch_from_row(row) for row in conn.execute(
                 "SELECT * FROM watches WHERE enabled=1 AND (?='public' OR reader_id=?)", (reader_id, reader_id))]
@@ -448,6 +454,10 @@ class Collector:
                     (canonical, article["title"], article["url"], article["summary"], source["id"],
                      source["name"], source["category"], article["published_at"], utc_now(), article["image_url"], reader_id, current["media_id"]))
                 if not inserted.rowcount:
+                    if source["kind"] == "dongqiudi" and article.get("dqd", {}).get("complete"):
+                        existing = conn.execute("SELECT id FROM articles WHERE canonical_url=?", (canonical,)).fetchone()
+                        if existing:
+                            self.persist_dqd(conn, existing["id"], article)
                     continue
                 count += 1
                 content = article.get("content")
@@ -455,14 +465,119 @@ class Collector:
                     conn.execute("INSERT INTO article_content(article_id,source_url,paragraphs,author,fetched_at) VALUES(?,?,?,?,?)",
                                  (inserted.lastrowid, article["url"], json.dumps(content["paragraphs"], ensure_ascii=False),
                                   content["author"], utc_now()))
-                conn.executemany("INSERT INTO article_topics(article_id,topic_id) VALUES(?,?)",
-                                 [(inserted.lastrowid, topic) for topic in article_topics(article, self.db.catalog)])
-                for watch in watches:
-                    if matches_watch(article, watch, self.db.catalog):
-                        conn.execute("INSERT INTO article_watches(article_id,watch_id) VALUES(?,?)", (inserted.lastrowid, watch["id"]))
+                if source["kind"] == "dongqiudi":
+                    self.persist_dqd(conn, inserted.lastrowid, article)
+                else:
+                    conn.executemany("INSERT INTO article_topics(article_id,topic_id) VALUES(?,?)",
+                                     [(inserted.lastrowid, topic) for topic in article_topics(article, self.db.catalog)])
+                if source["kind"] != "dongqiudi" or not article["dqd"]["complete"]:
+                    for watch in watches:
+                        if matches_watch(article, watch, self.db.catalog):
+                            conn.execute("INSERT INTO article_watches(article_id,watch_id) VALUES(?,?)", (inserted.lastrowid, watch["id"]))
             if reader_id == "public":
                 conn.execute("UPDATE sources SET last_success_at=?,last_error=NULL WHERE id=?", (utc_now(), source["id"]))
         return count
+
+    def persist_dqd(self, conn, article_id, article):
+        metadata = article["dqd"]
+        conn.execute("INSERT INTO dongqiudi_articles(article_id,author,complete) VALUES(?,?,?) ON CONFLICT(article_id) DO UPDATE SET author=excluded.author,complete=excluded.complete",
+                     (article_id, metadata["author"], int(metadata["complete"])))
+        if not metadata["complete"]:
+            return
+        conn.execute("UPDATE articles SET title=?,summary=?,published_at=COALESCE(?,published_at),image_url=COALESCE(?,image_url) WHERE id=?",
+                     (article["title"], article["summary"], article["published_at"], article["image_url"], article_id))
+        conn.execute("DELETE FROM dongqiudi_tags WHERE article_id=?", (article_id,))
+        conn.executemany("INSERT INTO dongqiudi_tags(article_id,kind,tag_id,name) VALUES(?,?,?,?)",
+                         [(article_id, tag["kind"], tag["id"], tag["name"]) for tag in metadata["tags"]])
+        content = article.get("content")
+        if content:
+            conn.execute("INSERT INTO article_content(article_id,source_url,paragraphs,author,fetched_at) VALUES(?,?,?,?,?) ON CONFLICT(article_id) DO NOTHING",
+                         (article_id, article["url"], json.dumps(content["paragraphs"], ensure_ascii=False), content["author"], utc_now()))
+        conn.execute("DELETE FROM article_topics WHERE article_id=?", (article_id,))
+        conn.executemany("INSERT OR IGNORE INTO article_topics(article_id,topic_id) VALUES(?,?)",
+                         [(article_id, topic) for topic in article_topics({**article, "category": "sports"}, self.db.catalog)])
+        scope = conn.execute("SELECT reader_id FROM articles WHERE id=?", (article_id,)).fetchone()["reader_id"]
+        for row in conn.execute("SELECT * FROM watches WHERE enabled=1 AND (?='public' OR reader_id=?)", (scope, scope)).fetchall():
+            watch = watch_from_row(row)
+            if matches_watch({**article, "category": "sports"}, watch, self.db.catalog):
+                conn.execute("INSERT OR IGNORE INTO article_watches(article_id,watch_id) VALUES(?,?)", (article_id, watch["id"]))
+
+    async def collect_dongqiudi(self, source):
+        from .dongqiudi import ARTICLE_URL, DETAIL_URL, HOME_URL, LIST_URL, RestrictedArticle, detail_page, list_page, next_list_url, public_article_id
+
+        async with self.dqd_lock:
+            now = asyncio.get_running_loop().time()
+            key = source["id"]
+            self.dqd_refreshed = {k: v for k, v in self.dqd_refreshed.items() if now - v < 60}
+            if key in self.dqd_refreshed:
+                return {"new_count": 0, "partial": False, "recent": True}
+            with self.db.connection() as conn:
+                current = conn.execute("SELECT * FROM sources WHERE id=? AND enabled=1 AND kind='dongqiudi'", (source["id"],)).fetchone()
+            if current is None:
+                raise ValueError("懂球帝来源已停用，请稍后再试")
+            source = dict(current)
+            items = []
+            completed = []
+            failed = 0
+            async with asyncio.timeout(65):
+                try:
+                    async with asyncio.timeout(10):
+                        data, _ = await self.fetcher(LIST_URL)
+                        items, after = list_page(data)
+                except (ValueError, OSError, httpx.HTTPError, TimeoutError):
+                    async with asyncio.timeout(10):
+                        data, _ = await self.fetcher(HOME_URL)
+                        items, after = list_page(data)
+                if after:
+                    try:
+                        async with asyncio.timeout(8):
+                            data, _ = await self.fetcher(next_list_url(after))
+                            older, _ = list_page(data)
+                        items.extend(older)
+                    except (ValueError, OSError, httpx.HTTPError, TimeoutError):
+                        failed += 1
+                items = list({item["url"]: item for item in items}.values())[:60]
+                with self.db.connection() as conn:
+                    placeholders = ",".join("?" for _ in items)
+                    known = {row["url"] for row in conn.execute("""SELECT a.url FROM articles a
+                        JOIN dongqiudi_articles d ON d.article_id=a.id
+                        WHERE d.complete=1 AND a.reader_id='public'
+                        AND a.url IN (""" + placeholders + ")", [item["url"] for item in items])}
+                pending = [item for item in items if item["url"] not in known]
+                slots = asyncio.Semaphore(3)
+
+                async def enrich(item):
+                    nonlocal failed
+                    async with slots:
+                        article_id = public_article_id(item["url"])
+                        try:
+                            async with asyncio.timeout(14):
+                                try:
+                                    async with asyncio.timeout(7):
+                                        data, _ = await self.fetcher(DETAIL_URL + article_id)
+                                        full = detail_page(data, article_id)
+                                except RestrictedArticle:
+                                    raise
+                                except (ValueError, OSError, httpx.HTTPError, TimeoutError):
+                                    data, _ = await self.fetcher(ARTICLE_URL.format(article_id))
+                                    full = detail_page(data, article_id)
+                            completed.append(full)
+                        except (ValueError, OSError, httpx.HTTPError, TimeoutError):
+                            failed += 1
+                            completed.append(item)
+                try:
+                    async with asyncio.timeout(35):
+                        async with asyncio.TaskGroup() as group:
+                            for item in pending:
+                                group.create_task(enrich(item))
+                except TimeoutError:
+                    failed += 1
+            # Unfinished details remain retryable; their list entries still appear.
+            resolved = {item["url"]: item for item in completed}
+            selected = [resolved.get(item["url"], item) for item in pending]
+            count = self.persist_articles(source, selected)
+            self.dqd_refreshed[key] = asyncio.get_running_loop().time()
+            return {"new_count": count, "partial": bool(failed), "recent": False}
 
     async def collect(self, run_id, categories, *, failed_only=False, skip_source_ids=()):
         new_count = 0
@@ -490,6 +605,10 @@ class Collector:
                     return
                 attempted += 1
                 try:
+                    if source["kind"] == "dongqiudi":
+                        result = await self.collect_dongqiudi(source)
+                        new_count += result["new_count"]
+                        return
                     data, base_url = await self.fetcher(source["url"])
                     articles = parse_source(data, source, base_url)
                     with self.db.connection() as conn:

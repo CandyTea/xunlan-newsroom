@@ -8,10 +8,12 @@ import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
@@ -123,7 +125,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await reader.stop()
         await guests.stop()
 
-    app = FastAPI(title="Newsroom", version="1.7.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.8.0", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -185,7 +187,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         services = guests.get(reader_id(session))
         if article is not None:
             services.db.ensure_article(article)
-            if urlsplit(article["url"]).hostname == "t.me":
+            if urlsplit(article["url"]).hostname in ("t.me", "pc.dongqiudi.com"):
                 with db.connection() as conn:
                     content = reader.cached(conn, article)
                 if content:
@@ -359,6 +361,12 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             with cache_db.connection() as cache_conn:
                 value["translation"] = scoped_translator.cached(cache_conn, row, translation_config)
         value["needs_translation"] = needs_translation(row)
+        dqd = conn.execute("SELECT author,complete FROM dongqiudi_articles WHERE article_id=?", (value["id"],)).fetchone()
+        if dqd:
+            tags = [dict(tag) for tag in conn.execute("SELECT kind,tag_id AS id,name FROM dongqiudi_tags WHERE article_id=? ORDER BY kind,name", (value["id"],))]
+            value["dongqiudi"] = {"author": dqd["author"], "complete": bool(dqd["complete"]),
+                                 "teams": [tag for tag in tags if tag["kind"] == "team"],
+                                 "players": [tag for tag in tags if tag["kind"] == "player"]}
         value["watches"] = [dict(hit) for hit in conn.execute("""SELECT w.id,w.name,w.type FROM watches w
                               JOIN article_watches h ON h.watch_id=w.id WHERE h.article_id=? AND w.reader_id=? ORDER BY w.id""", (value["id"], reader_id(session)))]
         return value
@@ -533,15 +541,69 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             visible_media(conn, media_id, session)
         return history.save(media_id, reader_id(session), body, body.content)
 
+    @app.get("/api/dongqiudi/options")
+    def dongqiudi_options(session=Depends(require_reader)):
+        with db.connection() as conn:
+            scope = reader_id(session)
+            tags = [dict(row) for row in conn.execute("""SELECT t.kind,t.tag_id AS id,MAX(t.name) AS name,COUNT(*) AS count
+                FROM dongqiudi_tags t JOIN articles a ON a.id=t.article_id
+                WHERE a.reader_id='public' OR a.reader_id=? GROUP BY t.kind,t.tag_id ORDER BY count DESC,name""", (scope,))]
+            authors = [dict(row) for row in conn.execute("""SELECT d.author AS name,COUNT(*) AS count
+                FROM dongqiudi_articles d JOIN articles a ON a.id=d.article_id
+                WHERE d.author<>'' AND (a.reader_id='public' OR a.reader_id=?) GROUP BY d.author ORDER BY count DESC,name""", (scope,))]
+            enabled = conn.execute("SELECT 1 FROM sources WHERE kind='dongqiudi' AND enabled=1").fetchone() is not None
+        return {"teams": [tag for tag in tags if tag["kind"] == "team"],
+                "players": [tag for tag in tags if tag["kind"] == "player"], "authors": authors, "enabled": enabled}
+
+    @app.post("/api/dongqiudi/refresh")
+    async def refresh_dongqiudi(session=Depends(require_reader)):
+        with db.connection() as conn:
+            source = conn.execute("SELECT * FROM sources WHERE kind='dongqiudi' AND enabled=1 ORDER BY id LIMIT 1").fetchone()
+        if source is None:
+            raise HTTPException(409, "懂球帝来源当前未启用")
+        try:
+            return await collector.collect_dongqiudi(dict(source))
+        except (TimeoutError, OSError, ValueError, httpx.HTTPError) as exc:
+            raise HTTPException(503, "暂时无法更新懂球帝资讯，请稍后重试。") from exc
+
     @app.get("/api/articles")
     def articles(category: str = "", q: str = Query("", max_length=200), following: bool = False,
                  saved: bool = False, unread: bool = False, watch_id: int | None = Query(None, gt=0),
                  company_id: int | None = Query(None, gt=0), league_id: str = Query("", max_length=80),
                  team_id: str = Query("", max_length=80), media_id: int | None = Query(None, gt=0),
                  cursor_id: int | None = Query(None, gt=0),
+                 dongqiudi: bool = False, dqd_team: str = Query("", max_length=20, pattern=r"^\d*$"),
+                 dqd_player: str = Query("", max_length=20, pattern=r"^\d*$"), dqd_author: str = Query("", max_length=200),
+                 published_from: date | None = None, published_to: date | None = None,
                  page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), session=Depends(require_reader)):
         conditions = ["(a.reader_id='public' OR a.reader_id=?)"]
         params = [reader_id(session)]
+        if dongqiudi:
+            conditions.append("EXISTS(SELECT 1 FROM dongqiudi_articles d WHERE d.article_id=a.id)")
+        elif media_id is None and not following and not saved:
+            conditions.append("NOT EXISTS(SELECT 1 FROM dongqiudi_articles d WHERE d.article_id=a.id)")
+        if (dqd_team or dqd_player or dqd_author) and not dongqiudi:
+            raise HTTPException(422, "懂球帝筛选应在懂球帝页面使用")
+        for kind, tag_id in (("team", dqd_team), ("player", dqd_player)):
+            if tag_id:
+                conditions.append("EXISTS(SELECT 1 FROM dongqiudi_tags t WHERE t.article_id=a.id AND t.kind=? AND t.tag_id=?)")
+                params.extend([kind, tag_id])
+        if dqd_author:
+            conditions.append("EXISTS(SELECT 1 FROM dongqiudi_articles d WHERE d.article_id=a.id AND d.author=?)")
+            params.append(dqd_author)
+        if published_from and published_to and published_from > published_to:
+            raise HTTPException(422, "开始日期不能晚于结束日期")
+        zone = ZoneInfo(reader_timezone(session))
+        try:
+            if published_from:
+                conditions.append("a.published_at>=?")
+                params.append(datetime.combine(published_from, datetime.min.time(), zone).astimezone(timezone.utc).isoformat())
+            if published_to:
+                until = published_to + timedelta(days=1)
+                conditions.append("a.published_at<?")
+                params.append(datetime.combine(until, datetime.min.time(), zone).astimezone(timezone.utc).isoformat())
+        except (ValueError, OverflowError) as exc:
+            raise HTTPException(422, "日期超出支持范围") from exc
         if media_id is not None:
             with db.connection() as conn:
                 visible_media(conn, media_id, session)

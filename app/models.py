@@ -94,7 +94,7 @@ class Schedule(StrictModel):
 class Source(StrictModel):
     name: str = Field(min_length=1, max_length=120)
     media_name: str = Field(default="", max_length=120)
-    kind: Literal["rss", "steam", "telegram"] = "rss"
+    kind: Literal["rss", "steam", "telegram", "dongqiudi"] = "rss"
     url: str = Field(default="", max_length=2048)
     category: Category
     enabled: bool = True
@@ -110,6 +110,10 @@ class Source(StrictModel):
             if not self.steam_appid:
                 raise ValueError("Steam 来源需要有效的 App ID")
             self.url = f"https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid={self.steam_appid}&count=100&maxlength=1800&format=json"
+        elif self.kind == "dongqiudi":
+            self.url = "https://www.dongqiudi.com/"
+            self.category = "sports"
+            self.steam_appid = None
         elif self.kind == "telegram":
             self.url = channel_url(self.url)
             self.steam_appid = None

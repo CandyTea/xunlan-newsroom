@@ -9,6 +9,7 @@
   {"seed_id":"guardian-premier-league","name":"The Guardian 英超","kind":"rss","url":"https://www.theguardian.com/football/premierleague/rss","category":"sports","enabled":true},
   {"seed_id":"guardian-real-madrid","name":"The Guardian 皇家马德里","kind":"rss","url":"https://www.theguardian.com/football/realmadrid/rss","category":"sports","enabled":true},
   {"seed_id":"telegram-fabrizio-romano","name":"罗马诺 · Telegram","kind":"telegram","url":"https://t.me/s/fabrizioromanotg","category":"sports","enabled":true},
+  {"seed_id":"dongqiudi-public-news","name":"懂球帝","media_name":"懂球帝","kind":"dongqiudi","url":"https://www.dongqiudi.com/","category":"sports","enabled":true},
   {"name":"中新网财经","kind":"rss","url":"https://www.chinanews.com.cn/rss/finance.xml","category":"stocks","enabled":true},
   {"name":"FT中文网","kind":"rss","url":"https://www.ftchinese.com/rss/feed","category":"stocks","enabled":true},
   {"name":"The Guardian 财经","kind":"rss","url":"https://www.theguardian.com/business/rss","category":"stocks","enabled":true},

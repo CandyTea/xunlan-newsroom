@@ -34,10 +34,11 @@ const deviceNews = { busy: false, lastAttempt: 0, controller: null, pending: nul
 const listTranslation = { controller: null, retryAfter: 0 };
 const streamNews = { observer: null, controller: null, busy: false, cursor: null, hasMore: false, error: "" };
 const historyNews = { controller: null, busy: false };
+const dqdNews = { options: null, filters: { team: "", player: "", author: "", from: "", to: "" }, busy: false, controller: null, started: false };
 let articleContentController = null;
 
 function canRead() { return Boolean(state.session?.authenticated || state.session?.guest); }
-function isReaderView() { return state.view === "news" || (state.view === "following" && (state.followingMode === "objects" || Boolean(state.mediaId))); }
+function isReaderView() { return state.view === "news" || state.view === "dongqiudi" || (state.view === "following" && (state.followingMode === "objects" || Boolean(state.mediaId))); }
 
 function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
@@ -194,6 +195,7 @@ async function refreshData() {
 }
 async function enterApp() {
   deviceNews.controller?.abort(); listTranslation.controller?.abort(); historyNews.controller?.abort(); stopStream(); closeModal();
+  dqdNews.controller?.abort(); Object.assign(dqdNews, { options: null, filters: { team: "", player: "", author: "", from: "", to: "" }, controller: null, busy: false, started: false });
   state.renderId += 1; state.articles = []; state.watches = []; state.media = []; state.mediaId = ""; state.schedules = []; state.status = {};
   state.settings = { timezone: "Asia/Shanghai" }; state.total = 0; state.fetching = false;
   deviceNews.lastAttempt = 0; listTranslation.retryAfter = 0;
@@ -250,11 +252,11 @@ function route() {
   const next = location.hash.slice(1); const mediaRoute = /^media\/([1-9]\d*)$/.exec(next);
   state.mediaId = mediaRoute ? mediaRoute[1] : "";
   state.followingMode = next === "following/media" || mediaRoute ? "media" : "objects";
-  state.view = state.followingMode === "media" ? "following" : ["news", "following", "schedules", "settings"].includes(next) ? next : "news";
+  state.view = state.followingMode === "media" ? "following" : ["news", "dongqiudi", "following", "schedules", "settings"].includes(next) ? next : "news";
   state.page = 1; state.watchId = ""; state.q = ""; state.saved = false; state.unread = false; state.manageWatches = false;
   if (state.view === "news") restoreFocus(); else state.category = "";
-  if (state.mediaId) { state.companyId = ""; state.leagueId = ""; state.teamId = ""; state.sportsWatchId = ""; }
-  document.title = `${{ news: "新闻", following: "我的关注", schedules: "收取计划", settings: "设置" }[state.view]} · 讯览`;
+  if (state.mediaId || state.view === "dongqiudi") { state.companyId = ""; state.leagueId = ""; state.teamId = ""; state.sportsWatchId = ""; }
+  document.title = `${{ news: "新闻", dongqiudi: "懂球帝", following: "我的关注", schedules: "收取计划", settings: "设置" }[state.view]} · 讯览`;
   closeModal(); renderView();
   document.querySelectorAll("[data-view]").forEach(link => { if (link.dataset.view === state.view) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current"); });
 }
@@ -262,7 +264,7 @@ async function renderView() {
   if (!canRead()) return;
   listTranslation.controller?.abort(); historyNews.controller?.abort(); stopStream();
   const id = ++state.renderId;
-  if (state.view === "news" || state.view === "following") {
+  if (state.view === "news" || state.view === "following" || state.view === "dongqiudi") {
     if (state.view === "following" && state.followingMode === "media" && !state.mediaId) return renderMediaList(id);
     if (state.manageWatches) return renderWatches(id);
     return renderReader(id);
@@ -317,7 +319,7 @@ function restoreFocus() {
   } catch { state.category = ""; state.companyId = ""; state.leagueId = ""; state.teamId = ""; state.sportsWatchId = ""; }
   normalizeFocus(); persistFocus();
 }
-function clearFilters() { state.q = ""; state.saved = false; state.unread = false; state.watchId = ""; state.category = ""; state.companyId = ""; state.leagueId = ""; state.teamId = ""; state.sportsWatchId = ""; state.page = 1; if (state.view === "news") persistFocus(); renderView(); }
+function clearFilters() { state.q = ""; state.saved = false; state.unread = false; state.watchId = ""; state.category = ""; state.companyId = ""; state.leagueId = ""; state.teamId = ""; state.sportsWatchId = ""; state.page = 1; if (state.view === "dongqiudi") dqdNews.filters = { team: "", player: "", author: "", from: "", to: "" }; if (state.view === "news") persistFocus(); renderView(); }
 function setFocus(values) { Object.assign(state, values); state.page = 1; normalizeFocus(); persistFocus(); renderView(); }
 function matchingWatch(preset, type) {
   const names = new Set([preset.name, ...(preset.aliases || [])].map(name => String(name).toLocaleLowerCase()));
@@ -366,12 +368,14 @@ function sportsFocusBar() {
   return el("section", { class: "focus-bar sports-focus", "aria-label": "体育焦点" }, [el("div", { class: "focus-fields" }, [formField("联赛", leagueSelect), formField("常用球队", teamSelect)]), el("div", { class: "focus-actions" }, [addCurrent, button("添加球队", () => watchForm({ type: "team", league_id: state.leagueId, enabled: true }, saved => setFocus({ teamId: "", sportsWatchId: String(saved.id) })), "button button-small", "plus")]), el("p", { class: "focus-hint", text: customLeague ? "当前按已关注联赛匹配；也可切换到上方预设联赛浏览常用球队。" : "常用球队仅供快捷选择；更多球队可以自行添加。" })]);
 }
 function openMedia(mediaId) {
+  if (state.media.find(media => String(media.id) === String(mediaId))?.name === "懂球帝") { location.hash = "dongqiudi"; return; }
   closeModal();
   const target = `#media/${mediaId}`;
   if (location.hash === target) route(); else location.hash = target;
 }
 function mediaSource(article) {
   const name = article.media_name || article.source_name || "原始来源";
+  if (article.dongqiudi) return button(name, () => { location.hash = "dongqiudi"; }, "media-source-link", null, { "aria-label": "查看懂球帝资讯" });
   return article.media_id ? button(name, () => openMedia(article.media_id), "media-source-link", null, { "aria-label": `查看${name}的全部消息` }) : el("span", { text: name });
 }
 function followingTabs() {
@@ -419,7 +423,85 @@ async function renderMediaList(id) {
     if (!state.media.length) content.replaceChildren(empty("还没有可浏览的媒体", "配置资讯来源后，媒体会出现在这里。"));
   } catch (error) { if (id === state.renderId && error.status !== 401) content.replaceChildren(errorPanel(error, renderView)); }
 }
+function dqdRefreshButton() {
+  return button(dqdNews.busy ? "正在更新…" : "更新资讯", () => refreshDongqiudi(), "button button-small", "refresh", { disabled: dqdNews.busy || dqdNews.options?.enabled === false, "data-dqd-refresh": true });
+}
+function syncDqdRefreshButtons() {
+  document.querySelectorAll("[data-dqd-refresh]").forEach(node => {
+    node.disabled = dqdNews.busy || dqdNews.options?.enabled === false;
+    node.replaceChildren(icon("refresh"), dqdNews.busy ? "正在更新…" : "更新资讯");
+  });
+}
+async function refreshDongqiudi(automatic = false) {
+  if (dqdNews.busy || !canRead()) return;
+  const session = state.session; const controller = new AbortController();
+  dqdNews.controller = controller; dqdNews.busy = true; dqdNews.started = true; syncDqdRefreshButtons();
+  try {
+    const result = await api("/dongqiudi/refresh", { method: "POST", body: {}, signal: controller.signal });
+    if (controller.signal.aborted || state.session !== session) return;
+    dqdNews.options = null;
+    if (!automatic) toast(result.recent ? "刚刚已更新，可稍后再次收取。" : `新增 ${result.new_count} 条懂球帝资讯${result.partial ? "，部分文章仍待补收" : ""}。`);
+    if (state.view === "dongqiudi") {
+      if (automatic && state.viewMode === "stream" && state.articles.length && $("#reader-list .news-list")) await refreshReaderNews();
+      else { if (!automatic) state.page = 1; await renderView(); }
+    }
+  } catch (error) {
+    if (!controller.signal.aborted && state.session === session) {
+      if (!automatic) showError(error);
+      else if (state.view === "dongqiudi") {
+        const list = $("#reader-list");
+        if (list) list.append(el("p", { class: "dqd-update-message", role: "status", text: "暂时未能更新懂球帝资讯，可以点击“更新资讯”重试。" }));
+      }
+    }
+  } finally {
+    if (dqdNews.controller === controller) { dqdNews.controller = null; dqdNews.busy = false; syncDqdRefreshButtons(); }
+  }
+}
+function dqdFilterForm() {
+  const options = dqdNews.options || { teams: [], players: [], authors: [] };
+  const controls = {};
+  const lists = [];
+  function choice(key, label, entries, current) {
+    const listId = `dqd-${key}-choices`;
+    const selected = entries.find(entry => entry.id === current);
+    const control = input(key, key === "author" ? current : selected?.name || "", { list: listId, maxlength: key === "author" ? 200 : 120, placeholder: `全部${label} · 输入名称选择`, autocomplete: "off" });
+    controls[key] = control;
+    lists.push(el("datalist", { id: listId }, entries.map(entry => el("option", { value: entry.name, text: `${entry.count} 篇` }))));
+    control.addEventListener("input", () => control.setCustomValidity(""));
+    return formField(label, control);
+  }
+  const start = input("from", dqdNews.filters.from, { type: "date", "aria-label": "开始日期" });
+  const end = input("to", dqdNews.filters.to, { type: "date", "aria-label": "结束日期" });
+  start.addEventListener("input", () => end.setCustomValidity(""));
+  end.addEventListener("input", () => end.setCustomValidity(""));
+  const form = el("form", { class: "dqd-filter-form", onsubmit: event => {
+    event.preventDefault();
+    function chosen(key, entries) {
+      const value = controls[key].value.trim();
+      if (!value) return "";
+      const entry = entries.find(item => item.name === value);
+      if (!entry) { controls[key].setCustomValidity("请从已有标签中选择，或清空此项。" ); controls[key].reportValidity(); return null; }
+      return entry.id;
+    }
+    const team = chosen("team", options.teams); if (team === null) return;
+    const player = chosen("player", options.players); if (player === null) return;
+    if (start.value && end.value && start.value > end.value) { end.setCustomValidity("结束日期不能早于开始日期。" ); end.reportValidity(); return; }
+    dqdNews.filters = { team, player, author: controls.author.value.trim(), from: start.value, to: end.value };
+    state.page = 1; renderView();
+  } }, [el("div", { class: "dqd-filter-fields" }, [
+    choice("team", "球队", options.teams, dqdNews.filters.team),
+    choice("player", "球员", options.players, dqdNews.filters.player),
+    choice("author", "文章作者", options.authors, dqdNews.filters.author),
+    formField("发布时间", el("div", { class: "dqd-date-range" }, [start, el("span", { text: "至" }), end])),
+  ]), ...lists, el("div", { class: "dqd-filter-actions" }, [
+    el("span", { class: "muted", text: `按懂球帝文章标签筛选，可组合条件；日期按 ${state.settings.timezone || "Asia/Shanghai"} 计算。` }),
+    button("清除筛选", clearFilters, "button button-small"),
+    el("button", { type: "submit", class: "button button-primary button-small", text: "应用筛选" }),
+  ])]);
+  return form;
+}
 function readerEmpty() {
+  if (state.view === "dongqiudi") return empty("暂无符合条件的懂球帝资讯", Object.values(dqdNews.filters).some(Boolean) || state.q || state.saved || state.unread ? "可以调整球队、球员、作者和日期，或清除筛选查看已收取的资讯。" : "公开新闻收取后会显示在这里，正文可直接在本站阅读。", [dqdRefreshButton(), button("清除筛选", clearFilters, "button button-small")]);
   if (state.mediaId) return empty("这个媒体暂无符合条件的资讯", state.q || state.saved || state.unread || state.category ? "可以清除筛选，查看这个媒体已收取的全部消息。" : "收取新资讯后，这个媒体的消息会显示在这里。", [button("收取资讯", () => requestFetch(), "button button-primary", "refresh"), button("清除筛选", clearFilters, "button button-small")]);
   if (state.category === "sports" && !state.q && !state.saved && !state.unread) return empty("还没有符合条件的体育资讯", "尚未收取到相关报道。可以收取新资讯，或清除联赛与球队筛选后查看全部报道。", [button("收取资讯", () => requestFetch(), "button button-primary", "refresh"), button("清除筛选", clearFilters, "button button-small")]);
   if (state.q || state.saved || state.unread || state.watchId || state.category || (state.view === "news" && (state.companyId || state.leagueId || state.teamId || state.sportsWatchId))) return empty("还没有符合条件的资讯", "试试其他栏目、公司或球队，也可以清除筛选查看已收取的全部资讯。", [button("清除筛选", clearFilters, "button button-small")]);
@@ -433,7 +515,11 @@ function readerParams(cursor = null) {
   if (state.q) params.set("q", state.q);
   if (state.watchId) params.set("watch_id", state.watchId);
   if (state.mediaId) params.set("media_id", state.mediaId);
-  if (!following && !state.mediaId) {
+  if (state.view === "dongqiudi") {
+    params.set("dongqiudi", "true");
+    for (const [key, parameter] of Object.entries({ team: "dqd_team", player: "dqd_player", author: "dqd_author", from: "published_from", to: "published_to" })) if (dqdNews.filters[key]) params.set(parameter, dqdNews.filters[key]);
+  }
+  if (!following && !state.mediaId && state.view !== "dongqiudi") {
     if (state.category === "sports") {
       if (state.sportsWatchId) params.set("watch_id", state.sportsWatchId);
       else { if (state.leagueId) params.set("league_id", state.leagueId); if (state.teamId) params.set("team_id", state.teamId); }
@@ -571,6 +657,14 @@ async function loadOlderMessages() {
 }
 async function renderReader(id, quiet = false) {
   listTranslation.controller?.abort();
+  const dongqiudi = state.view === "dongqiudi";
+  if (dongqiudi && !dqdNews.options) {
+    if (!quiet) main.replaceChildren(loading("正在载入懂球帝…"));
+    try {
+      const options = await api("/dongqiudi/options"); if (id !== state.renderId) return;
+      dqdNews.options = options;
+    } catch (error) { if (id === state.renderId) main.replaceChildren(errorPanel(error, renderView)); return; }
+  }
   const publisher = Boolean(state.mediaId);
   let media = publisher ? state.media.find(item => String(item.id) === state.mediaId) : null;
   if (publisher && !media) {
@@ -582,7 +676,7 @@ async function renderReader(id, quiet = false) {
   }
   const following = state.view === "following" && !publisher;
   const subtitle = following ? "从已收取的资讯中，找到你关心的人和事。" : "按栏目阅读，按兴趣关注。";
-  const head = publisher ? heading(media.name, "这个媒体已收取的全部消息，按发布时间排序。", [button("返回媒体", () => { location.hash = "following/media"; }, "button"), historyButton(), mediaFollowButton(media)]) : heading(following ? "我的关注" : "今日资讯", subtitle, following ? [button("管理关注", showWatchManager, "button", "edit")] : [button("关注媒体", () => { location.hash = "following/media"; }, "button")]);
+  const head = dongqiudi ? heading("懂球帝", "集中阅读体育新闻，筛选你关心的球队、球员和作者。", [dqdRefreshButton()]) : publisher ? heading(media.name, "这个媒体已收取的全部消息，按发布时间排序。", [button("返回媒体", () => { location.hash = "following/media"; }, "button"), historyButton(), mediaFollowButton(media)]) : heading(following ? "我的关注" : "今日资讯", subtitle, following ? [button("管理关注", showWatchManager, "button", "edit")] : [button("关注媒体", () => { location.hash = "following/media"; }, "button")]);
   if (publisher) document.title = `${media.name} · 讯览`;
   const categories = el("nav", { class: "category-tabs", "aria-label": "资讯栏目" }, Object.entries({ "": "全部", ...CATEGORIES }).map(([key, name]) => button(name, () => setFilter("category", key), "", null, { "aria-pressed": String(state.category === key) })));
   const search = el("form", { class: "search-form", role: "search", onsubmit: event => { event.preventDefault(); setFilter("q", $("input", search).value.trim()); } }, [input("q", state.q, { type: "search", placeholder: "搜索标题与摘要", "aria-label": "搜索资讯", maxlength: 200 }), el("button", { class: "icon-button", type: "submit", "aria-label": "搜索" }, icon("search"))]);
@@ -599,8 +693,8 @@ async function renderReader(id, quiet = false) {
     head,
     state.view === "following" ? followingTabs() : null,
     following && !state.watches.length ? el("div", { class: "following-intro" }, [el("p", {}, [el("strong", { text: "还没有关注对象" }), " · 添加关注后，相关资讯会出现在这里。"]), button("添加", () => watchForm(), "button button-small", "plus")]) : null,
-    categories,
-    !following && !publisher ? focusBar() : null,
+    dongqiudi ? dqdFilterForm() : categories,
+    !following && !publisher && !dongqiudi ? focusBar() : null,
     tools,
     list,
   ].filter(Boolean));
@@ -612,6 +706,7 @@ async function renderReader(id, quiet = false) {
     if (!state.articles.length) {
       list.replaceChildren(readerEmpty());
       const historyControl = historyButton(); if (historyControl) list.append(el("div", { class: "reader-more-actions" }, historyControl));
+      if (dongqiudi && !dqdNews.started && dqdNews.options?.enabled) refreshDongqiudi(true);
       return;
     }
     list.replaceChildren(el("div", { class: "list-meta" }, [el("span", { id: "reader-count", text: `共 ${state.total} 条${following ? "关注" : ""}资讯` }), el("span", { text: "按发布时间排序" }), button("有更新，点击刷新", () => { renderView(); window.scrollTo({ top: 0, behavior: "instant" }); }, "reader-update", null, { id: "reader-update", hidden: true })]), el("div", { class: "news-list" }, state.articles.map(articleRow)));
@@ -623,6 +718,7 @@ async function renderReader(id, quiet = false) {
     }
     if (quiet) window.scrollTo({ top: scrollY, behavior: "instant" });
     autoTranslateList(id);
+    if (dongqiudi && !dqdNews.started && dqdNews.options?.enabled) refreshDongqiudi(true);
   } catch (error) { if (!quiet && id === state.renderId && error.status !== 401) list.replaceChildren(errorPanel(error, renderView)); }
 }
 function changePage(delta) { state.page += delta; renderView(); window.scrollTo({ top: 0, behavior: "instant" }); }
@@ -631,6 +727,7 @@ function articleRow(article) {
   const display = translated || article;
   const title = el("h2", {}, button(display.title || "无标题资讯", () => articleDetail(article.id), "article-link"));
   const meta = el("div", { class: "news-meta" }, [el("span", { class: "news-category", text: CATEGORIES[article.category] || "资讯" }), el("span", { class: "meta-divider", text: "·" }), mediaSource(article), el("span", { class: "meta-divider", text: "·" }), el("time", { datetime: article.published_at || article.fetched_at, text: articleTime(article.published_at) })]);
+  if (article.dongqiudi?.author) meta.append(el("span", { class: "meta-divider", text: "·" }), el("span", { text: article.dongqiudi.author }));
   const save = button(article.saved ? "已收藏" : "收藏", async event => {
     event.stopPropagation(); save.disabled = true;
     try { const updated = await api(`/articles/${article.id}`, { method: "PATCH", body: { saved: !article.saved } }); article.saved = typeof updated.saved === "boolean" ? updated.saved : !article.saved; save.replaceChildren(icon("bookmark"), article.saved ? "已收藏" : "收藏"); save.setAttribute("aria-pressed", String(article.saved)); toast(article.saved ? "已加入收藏" : "已取消收藏"); if (state.saved && !article.saved) renderView(); }
