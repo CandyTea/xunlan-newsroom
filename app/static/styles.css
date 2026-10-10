@@ -33,3 +33,5 @@
 .dqd-filter-actions .muted{font-size:11px;line-height:1.7;flex:1;min-width:220px}
 .dqd-update-message{font-size:12px;line-height:1.7;color:var(--muted);margin:16px 0}
 @media(max-width:760px){.bottom-nav a{width:19%;min-width:0}.dqd-filter-fields{grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 12px}.dqd-filter-fields>label:nth-child(3){grid-column:1/-1}.dqd-filter-fields input{font-size:16px}.dqd-filter-actions .muted{flex-basis:100%}.dqd-filter-actions{justify-content:flex-end}.dqd-filter-form{padding:16px 0}.dqd-date-range{max-width:none}}
+
+.x-presets{display:flex;gap:10px;flex-wrap:wrap;margin-top:-8px;margin-bottom:8px}

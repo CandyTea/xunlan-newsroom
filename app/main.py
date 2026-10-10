@@ -26,7 +26,7 @@ from .db import Database, default_media_name, ensure_media, utc_now
 from .guests import GuestReaders
 from .history import HistoryError, TelegramHistory
 from .dns import dns_mode
-from .models import ArticleHtml, ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, HistoryCursor, HistoryImport, MediaFollow, ReadingPreferences, Schedule, Settings, Setup, Source, TranslationRequest, TranslationSettings, Watch
+from .models import ArticleHtml, ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, HistoryCursor, HistoryImport, MediaFollow, ReadingPreferences, Schedule, Settings, Setup, Source, TranslationRequest, TranslationSettings, Watch, XFollow
 from .scheduler import Scheduler, next_run, schedule_from_row
 from .translation import PROVIDERS, TranslationError, Translator, needs_translation
 
@@ -97,7 +97,9 @@ class BodyLimitMiddleware:
 
 
 def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
+    from .xfeeds import mirror_urls
     fetch_config()
+    x_origins = " ".join(mirror_urls())
     db = Database(Path(data_dir or os.getenv("NEWSROOM_DATA_DIR", ROOT / "data")) / "newsroom.sqlite3")
     db.initialize()
     collector = Collector(db, fetcher)
@@ -125,7 +127,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await reader.stop()
         await guests.stop()
 
-    app = FastAPI(title="Newsroom", version="1.8.1", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.9.0", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -137,7 +139,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; connect-src 'self' https://t.me https://raw.githubusercontent.com https://www.espn.com https://api.rss2json.com https://api.allorigins.win https://r.jina.ai; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        response.headers["Content-Security-Policy"] = f"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; connect-src 'self' https://t.me https://raw.githubusercontent.com https://www.espn.com https://api.rss2json.com https://api.allorigins.win https://r.jina.ai {x_origins}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         if request.url.path.startswith("/api/") or request.url.path in ("/", "/admin"):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -187,7 +189,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         services = guests.get(reader_id(session))
         if article is not None:
             services.db.ensure_article(article)
-            if urlsplit(article["url"]).hostname in ("t.me", "pc.dongqiudi.com"):
+            if urlsplit(article["url"]).hostname in ("t.me", "pc.dongqiudi.com", "x.com"):
                 with db.connection() as conn:
                     content = reader.cached(conn, article)
                 if content:
@@ -326,6 +328,8 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             values.append(media_id)
         rows = conn.execute("""SELECT * FROM (
             SELECT m.id,m.name,
+                EXISTS(SELECT 1 FROM sources s WHERE s.media_id=m.id AND s.enabled=1 AND s.kind='x') AS x_supported,
+                (SELECT s.url FROM sources s WHERE s.media_id=m.id AND s.enabled=1 AND s.kind='x' ORDER BY s.id LIMIT 1) AS x_account,
                 EXISTS(SELECT 1 FROM sources s WHERE s.media_id=m.id AND s.enabled=1 AND s.kind='telegram') AS history_supported,
                 (SELECT COUNT(*) FROM sources s WHERE s.media_id=m.id AND s.enabled=1) AS source_count,
                 (SELECT COUNT(*) FROM articles a WHERE a.media_id=m.id AND (a.reader_id='public' OR a.reader_id=?)) AS article_count,
@@ -333,7 +337,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             FROM media m""" + where + """
             ) WHERE source_count>0 OR article_count>0 OR followed=1
             ORDER BY followed DESC,name COLLATE NOCASE,id""", values).fetchall()
-        return [{**dict(row), "followed": bool(row["followed"]), "history_supported": bool(row["history_supported"])} for row in rows]
+        return [{**dict(row), "followed": bool(row["followed"]), "history_supported": bool(row["history_supported"]), "x_supported": bool(row["x_supported"])} for row in rows]
 
     def visible_media(conn, media_id, session):
         items = media_for_reader(conn, session, media_id)
@@ -522,6 +526,42 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
                 conn.execute("DELETE FROM media_follows WHERE reader_id=? AND media_id=?", (reader_id(session), media_id))
             value["followed"] = body.followed
             return value
+
+    @app.post("/api/x/follow")
+    def follow_x(body: XFollow, session=Depends(require_reader)):
+        from .xfeeds import PRESETS
+        scope = reader_id(session)
+        with db.connection(write=True) as conn:
+            existing = conn.execute("SELECT * FROM sources WHERE kind='x' AND url=? ORDER BY enabled DESC,id LIMIT 1", (body.account,)).fetchone()
+            if existing and not existing["enabled"]:
+                raise HTTPException(409, "这个账号的来源已由管理员停用")
+            if existing is None:
+                if conn.execute("SELECT COUNT(*) FROM sources WHERE kind='x'").fetchone()[0] >= 200:
+                    raise HTTPException(409, "站点的 X 订阅已满，请联系管理员整理来源")
+            followed = bool(existing and conn.execute("SELECT 1 FROM media_follows WHERE reader_id=? AND media_id=?", (scope, existing["media_id"])).fetchone())
+            if not followed and conn.execute("SELECT COUNT(*) FROM media_follows f JOIN media m ON m.id=f.media_id WHERE f.reader_id=? AND EXISTS(SELECT 1 FROM sources s WHERE s.media_id=m.id AND s.kind='x')", (scope,)).fetchone()[0] >= 25:
+                raise HTTPException(409, "最多关注 25 个 X 账号，请先取消一个关注")
+            if existing is None:
+                username = urlsplit(body.account).path.strip("/")
+                name = PRESETS.get(username, "@" + username) + " · X"
+                media_id = ensure_media(conn, name)
+                conn.execute("INSERT INTO sources(name,kind,url,category,enabled,media_id) VALUES(?,'x',?,?,1,?)", (name, body.account, body.category, media_id))
+            else:
+                media_id = existing["media_id"]
+            conn.execute("INSERT OR IGNORE INTO media_follows(reader_id,media_id) VALUES(?,?)", (scope, media_id))
+            return visible_media(conn, media_id, session)
+
+    @app.post("/api/media/{media_id}/x/refresh")
+    async def refresh_x(media_id: int, session=Depends(require_reader)):
+        with db.connection() as conn:
+            visible_media(conn, media_id, session)
+            source = conn.execute("SELECT * FROM sources WHERE media_id=? AND kind='x' AND enabled=1 ORDER BY id LIMIT 1", (media_id,)).fetchone()
+        if source is None:
+            raise HTTPException(409, "此媒体没有启用的 X 订阅")
+        try:
+            return await collector.collect_x(dict(source))
+        except ValueError as exc:
+            raise HTTPException(409, "此 X 账号已停用或地址改变，请重新打开") from exc
 
     @app.get("/api/media/{media_id}/history")
     def media_history(media_id: int, session=Depends(require_reader)):
@@ -786,7 +826,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             return {"items": [source_from_row(row, conn) for row in conn.execute("SELECT * FROM sources ORDER BY category,id")]}
 
     async def write_source(body, source_id=None):
-        if body.kind != "telegram":
+        if body.kind not in ("telegram", "x"):
             try:
                 await resolve_public_url(body.url)
             except (ValueError, TimeoutError, OSError) as exc:
@@ -878,13 +918,18 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         accepted, run_id = await collector.start(body.categories, **options)
         return {"accepted": accepted, "run_id": run_id, "message": "采集已启动" if accepted else "已有采集正在进行，未重复启动"}
 
-    @app.get("/api/browser/sources", dependencies=[Depends(require_reader)])
-    def browser_sources():
+    @app.get("/api/browser/sources")
+    def browser_sources(media_id: int | None = Query(None, gt=0), session=Depends(require_reader)):
+        from .xfeeds import source_routes
         with db.connection() as conn:
-            items = [{**{key: row[key] for key in ("id", "name", "kind", "url", "category")},
-                      "cache_url": browser_cache_url(row["url"]) if row["url"] in browser_urls else None}
-                     for row in conn.execute("SELECT * FROM sources WHERE enabled=1 AND kind IN ('rss','telegram') ORDER BY id")
-                     if browser_source_allowed(row, browser_urls)]
+            items = [{**{key: row[key] for key in ("id", "name", "kind", "url", "category", "media_id")},
+                      "cache_url": browser_cache_url(row["url"]) if row["url"] in browser_urls else None,
+                      "routes": source_routes(row["url"]) if row["kind"] == "x" else None}
+                     for row in conn.execute("SELECT * FROM sources WHERE enabled=1 AND kind IN ('rss','telegram','x') ORDER BY id")
+                     if browser_source_allowed(row, browser_urls)
+                     and (media_id is None or row["media_id"] == media_id)
+                     and (row["kind"] != "x" or media_id is not None
+                          or conn.execute("SELECT 1 FROM media_follows WHERE reader_id=? AND media_id=?", (reader_id(session), row["media_id"])).fetchone())]
         return {"items": items}
 
     @app.post("/api/browser/import")
@@ -893,7 +938,8 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             row = ensure_row(conn, "sources", body.source_id)
             if not row["enabled"] or row["url"] != body.source_url or not browser_source_allowed(row, browser_urls):
                 raise HTTPException(409, "此来源已停用或地址改变，未保存客户端数据")
-            if (row["kind"] == "telegram") != (body.format == "telegram"):
+            if ((row["kind"] == "telegram") != (body.format == "telegram")
+                    or (row["kind"] == "x") != (body.format == "x")):
                 raise HTTPException(422, "消息格式与来源类型不一致")
             source = dict(row)
         try:
@@ -904,7 +950,8 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             with db.connection() as conn:
                 row = ensure_row(conn, "sources", body.source_id)
                 if (not row["enabled"] or row["url"] != body.source_url or not browser_source_allowed(row, browser_urls)
-                        or (row["kind"] == "telegram") != (body.format == "telegram")):
+                        or (row["kind"] == "telegram") != (body.format == "telegram")
+                        or (row["kind"] == "x") != (body.format == "x")):
                     raise HTTPException(409, "此来源已停用或地址改变，未保存客户端数据")
                 source = dict(row)
             new_count = collector.persist_articles(source, articles, reader_id(session) if session.get("guest") else "public")

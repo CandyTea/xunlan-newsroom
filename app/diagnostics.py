@@ -48,8 +48,12 @@ async def _check_sources(sources):
     async def check(source):
         async with semaphore:
             try:
-                data, final_url = await fetch_public(source["url"])
-                articles = parse_source(data, source, final_url)
+                if source["kind"] == "x":
+                    from .xfeeds import fetch_x
+                    articles, _ = await fetch_x(source["url"])
+                else:
+                    data, final_url = await fetch_public(source["url"])
+                    articles = parse_source(data, source, final_url)
                 result = {"source": source, "ok": True, "count": len(articles), "error": ""}
             except Exception as exc:
                 result = {"source": source, "ok": False, "count": 0, "error": safe_error(exc)}

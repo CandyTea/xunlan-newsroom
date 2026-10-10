@@ -28,6 +28,10 @@ def default_media_name(source):
         return "The Guardian"
     if host == "t.me" and urlsplit(source["url"]).path.rstrip("/").lower() == "/s/fabrizioromanotg":
         return "罗马诺"
+    if source["kind"] == "x":
+        from .xfeeds import PRESETS, account_url
+        username = urlsplit(account_url(source["url"])).path.strip("/")
+        return PRESETS.get(username, "@" + username) + " · X"
     if source["kind"] == "dongqiudi":
         return "懂球帝"
     return source["name"]

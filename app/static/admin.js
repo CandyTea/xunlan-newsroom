@@ -107,7 +107,7 @@ async function renderAdmin() {
     main.replaceChildren(
       el("div", { class: "view-heading" }, el("div", {}, [el("h1", { text: "收取管理" }), el("p", { text: "管理来源、服务端收取偏好与执行记录。" })])),
       section("来源连接", "本页重试由服务器执行。阅读页会自动补收海外资讯，路线错误记录在下方的最近收取记录。", networkBox()),
-      section("资讯来源", "支持公开 RSS / Atom、Steam 官方资讯、Telegram 公开频道和懂球帝公开新闻。", el("div", { id: "source-list", class: "manage-list sources-list" }, state.sources.length ? state.sources.map(sourceRow) : el("p", { class: "inline-empty", text: "还没有来源。添加订阅地址、Steam 游戏 App ID 或 Telegram 频道用户名。" })), button("添加来源", () => sourceForm(), "button button-small", "plus")),
+      section("资讯来源", "支持公开 RSS / Atom、Steam 官方资讯、Telegram 公开频道、懂球帝公开新闻和免费的 X 账号动态。", el("div", { id: "source-list", class: "manage-list sources-list" }, state.sources.length ? state.sources.map(sourceRow) : el("p", { class: "inline-empty", text: "还没有来源。添加订阅地址、Steam 游戏 App ID 或 Telegram 频道用户名。" })), button("添加来源", () => sourceForm(), "button button-small", "plus")),
       section("服务端收取偏好", "时区影响账号的收取计划；游客使用自己的时区。补收会合并遗漏的任务。", settingsForm()),
       section("收取状态", "计划与手动收取共用已启用的来源。", el("div", { id: "admin-status" }, statusBox())),
       section("最近收取记录", "成功来源会保留资讯；失败原因记录在这里。", el("div", { id: "run-history" }, runTable(runs.items || [])), button("刷新", refreshRuns, "button button-small", "refresh")),
@@ -148,10 +148,10 @@ async function retryFailedSources() {
   finally { state.retrying = false; const target = $("#source-network"); if (target) target.replaceWith(networkBox()); }
 }
 function sourceRow(source) {
-  return el("article", { class: "manage-row" }, [el("div", { class: "manage-copy" }, [el("h3", { class: source.enabled ? "" : "disabled-text" }, [source.name, el("span", { class: "manage-type", text: `${CATEGORIES[source.category] || "资讯"} · ${source.kind === "dongqiudi" ? "懂球帝" : source.kind === "telegram" ? "Telegram" : source.kind === "steam" ? "Steam" : "RSS"}` })]), el("p", { class: "source-url", text: source.kind === "steam" ? `Steam App ID：${source.steam_appid || "未设置"}` : source.url }), el("p", { text: source.last_success_at ? `最近成功（服务器或设备）：${dateTime(source.last_success_at)}` : "尚未成功收取" }), source.last_error && el("p", { class: "source-error", text: `服务器收取：${source.last_error}` }), source.last_error && el("p", { class: "muted", text: sourceHint(source.last_error) }), !source.enabled && el("span", { class: "enabled-label off", text: "已停用" })]), el("div", { class: "row-actions" }, [button("", () => sourceForm(source), "icon-button", "edit", { "aria-label": `编辑来源 ${source.name}` }), button("", () => deleteSource(source), "icon-button", "trash", { "aria-label": `删除来源 ${source.name}` })])]);
+  return el("article", { class: "manage-row" }, [el("div", { class: "manage-copy" }, [el("h3", { class: source.enabled ? "" : "disabled-text" }, [source.name, el("span", { class: "manage-type", text: `${CATEGORIES[source.category] || "资讯"} · ${source.kind === "x" ? "X" : source.kind === "dongqiudi" ? "懂球帝" : source.kind === "telegram" ? "Telegram" : source.kind === "steam" ? "Steam" : "RSS"}` })]), el("p", { class: "source-url", text: source.kind === "steam" ? `Steam App ID：${source.steam_appid || "未设置"}` : source.url }), el("p", { text: source.last_success_at ? `最近成功（服务器或设备）：${dateTime(source.last_success_at)}` : "尚未成功收取" }), source.last_error && el("p", { class: "source-error", text: `服务器收取：${source.last_error}` }), source.last_error && el("p", { class: "muted", text: sourceHint(source.last_error) }), !source.enabled && el("span", { class: "enabled-label off", text: "已停用" })]), el("div", { class: "row-actions" }, [button("", () => sourceForm(source), "icon-button", "edit", { "aria-label": `编辑来源 ${source.name}` }), button("", () => deleteSource(source), "icon-button", "trash", { "aria-label": `删除来源 ${source.name}` })])]);
 }
 function sourceForm(source = {}) {
-  const kind = select("kind", { rss: "公开 RSS / Atom", steam: "Steam 官方游戏资讯", telegram: "Telegram 公开频道", dongqiudi: "懂球帝公开新闻" }, source.kind || "rss");
+  const kind = select("kind", { rss: "公开 RSS / Atom", steam: "Steam 官方游戏资讯", telegram: "Telegram 公开频道", dongqiudi: "懂球帝公开新闻", x: "X 公开账号（免费）" }, source.kind || "rss");
   const url = input("url", source.url || "", { type: "url", maxlength: 2048, placeholder: "https://example.com/feed.xml" });
   const appid = input("steam_appid", source.steam_appid || "", { type: "number", min: 1, max: 2147483647, step: 1, placeholder: "如：570" });
   const urlTitle = el("span", { text: "订阅地址" });
@@ -161,13 +161,13 @@ function sourceForm(source = {}) {
   const form = el("form", { class: "modal-form" }, [field("来源名称", input("name", source.name || "", { required: true, maxlength: 120, placeholder: "为来源起一个名称" })), field("媒体名称", input("media_name", source.media_name || "", { maxlength: 120, placeholder: "如：ESPN、罗马诺" }), "同一媒体的多个订阅填写相同名称，消息会汇集到同一个媒体页。留空时自动归属，编辑时保留原归属。"), el("div", { class: "form-row" }, [field("来源类型", kind), field("所属栏目", select("category", CATEGORIES, source.category || "games"))]), urlField, steamField, check("enabled", "启用此来源", source.enabled !== false), footer(source.id ? "保存修改" : "添加来源")]);
   function toggle() {
     const steam = kind.value === "steam"; const telegram = kind.value === "telegram";
-    const dongqiudi = kind.value === "dongqiudi";
+    const dongqiudi = kind.value === "dongqiudi"; const x = kind.value === "x";
     urlField.hidden = steam || dongqiudi; url.disabled = steam || dongqiudi; url.required = !steam && !dongqiudi;
     const category = $("[name=category]", form); if (dongqiudi) category.value = "sports"; category.disabled = dongqiudi;
-    url.type = telegram ? "text" : "url";
-    url.placeholder = telegram ? "@FabrizioRomanoTG 或 https://t.me/FabrizioRomanoTG" : "https://example.com/feed.xml";
-    urlTitle.textContent = telegram ? "公开频道用户名 / 链接" : "订阅地址";
-    urlHint.textContent = telegram ? "可填写 FabrizioRomanoTG、@FabrizioRomanoTG 或 t.me 公开频道链接。无需账号、Bot Token 或付费 API；不支持私密邀请链接和纯数字 ID。" : "使用可公开访问的 HTTP / HTTPS RSS 或 Atom 地址。";
+    url.type = telegram || x ? "text" : "url";
+    url.placeholder = x ? "@elonmusk 或 https://x.com/thsottiaux" : telegram ? "@FabrizioRomanoTG 或 https://t.me/FabrizioRomanoTG" : "https://example.com/feed.xml";
+    urlTitle.textContent = x ? "X 账号 / 主页链接" : telegram ? "公开频道用户名 / 链接" : "订阅地址";
+    urlHint.textContent = x ? "填写公开账号用户名或主页链接。后台读取免费的公开镜像，无需 X 登录凭据或付费 API；镜像可能暂时不可用。" : telegram ? "可填写 FabrizioRomanoTG、@FabrizioRomanoTG 或 t.me 公开频道链接。无需账号、Bot Token 或付费 API；不支持私密邀请链接和纯数字 ID。" : "使用可公开访问的 HTTP / HTTPS RSS 或 Atom 地址。";
     steamField.hidden = !steam; appid.disabled = !steam; appid.required = steam;
   }
   kind.addEventListener("change", toggle); toggle();
@@ -176,7 +176,7 @@ function sourceForm(source = {}) {
     const body = { name: data.get("name").trim(), media_name: data.get("media_name").trim(), kind: data.get("kind"), category: dongqiudi ? "sports" : data.get("category"), enabled: data.has("enabled"), url: dongqiudi ? "https://www.dongqiudi.com/" : steam ? "" : data.get("url").trim() };
     if (steam) body.steam_appid = Number(data.get("steam_appid"));
     if (!body.name) { formError(form, new Error("请输入来源名称。")); return; }
-    if (!steam && body.kind !== "telegram") { try { const parsed = new URL(body.url); if (!["http:", "https:"].includes(parsed.protocol)) throw new Error(); } catch { formError(form, new Error("请输入有效的公开 HTTP / HTTPS 地址。")); return; } }
+    if (!steam && !["telegram", "x"].includes(body.kind)) { try { const parsed = new URL(body.url); if (!["http:", "https:"].includes(parsed.protocol)) throw new Error(); } catch { formError(form, new Error("请输入有效的公开 HTTP / HTTPS 地址。")); return; } }
     submit.disabled = true;
     try { await api(source.id ? `/sources/${source.id}` : "/sources", { method: source.id ? "PUT" : "POST", body }); closeModal(); toast("资讯来源已保存"); await renderAdmin(); }
     catch (error) { formError(form, error); } finally { submit.disabled = false; }

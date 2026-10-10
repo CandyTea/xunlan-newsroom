@@ -55,6 +55,23 @@ window.BrowserNews = (() => {
         content = data.content;
         if (new TextEncoder().encode(content).byteLength > MAX_BYTES) throw new Error("缓存内容超过 2 MB");
       }
+      if (route.format === "x-json") {
+        const payload = JSON.parse(content);
+        if (payload.status !== "ok" || !Array.isArray(payload.items) || payload.items.length > 100) throw new Error("X 订阅转换未返回有效动态");
+        const doc = document.implementation.createDocument(null, "rss");
+        const channel = doc.createElement("channel"); doc.documentElement.append(channel);
+        for (const entry of payload.items) {
+          const item = doc.createElement("item"); channel.append(item);
+          for (const [tag, value] of Object.entries({ title: entry.title, link: entry.link, description: entry.content || entry.description, pubDate: entry.pubDate })) {
+            const child = doc.createElement(tag); child.textContent = typeof value === "string" ? value : ""; item.append(child);
+          }
+        }
+        content = new XMLSerializer().serializeToString(doc); format = "x";
+      }
+      if (format === "x") {
+        validateXContent(content, route.sourceUrl);
+        return { content, format: "x" };
+      }
       if (format === "telegram") {
         const preview = document.createElement("template");
         preview.innerHTML = content;
@@ -89,6 +106,20 @@ window.BrowserNews = (() => {
 
   function routes(source) {
     const encoded = encodeURIComponent(source.url);
+    if (source.kind === "x") {
+      const mirrors = source.routes || [];
+      const rss = mirrors.filter(route => new URL(route.url).pathname.endsWith("/rss"));
+      const options = [
+        ...rss.flatMap(route => [
+          { name: "公开 X RSS", url: route.url, sourceUrl: source.url, format: "x", timeout: 4000 },
+          { name: "X RSS 转换", url: `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(route.url)}`, sourceUrl: source.url, format: "x-json", timeout: 8000 },
+          { name: "公开 X 页面", url: `https://api.allorigins.win/raw?url=${encodeURIComponent(route.url.replace(/\/rss$/, ""))}`, sourceUrl: source.url, format: "x", timeout: 8000 },
+          { name: "X RSS 读取", url: `https://api.allorigins.win/raw?url=${encodeURIComponent(route.url)}`, sourceUrl: source.url, format: "x", timeout: 8000 },
+        ]),
+      ];
+      if (source.cache_url) options.unshift({ name: "GitHub 动态缓存", url: source.cache_url, sourceUrl: source.url, format: "cache", expectedFormat: "x", timeout: 8000 });
+      return options;
+    }
     if (source.kind === "telegram") {
       const options = [
         { name: "Telegram 公开页面", url: source.url, sourceUrl: source.url, format: "telegram" },
@@ -108,6 +139,49 @@ window.BrowserNews = (() => {
     return options;
   }
 
+  function validateXContent(content, sourceUrl) {
+    const username = new URL(sourceUrl).pathname.slice(1).toLowerCase();
+    const isPost = value => {
+      try {
+        const url = new URL(value, sourceUrl);
+        const match = /^\/([A-Za-z0-9_]{1,15})\/status\/([1-9][0-9]{0,19})\/?$/.exec(url.pathname);
+        return Boolean(match && match[1].toLowerCase() === username && BigInt(match[2]) <= 9223372036854775807n);
+      } catch { return false; }
+    };
+    if (/^\s*(?:<\?xml\b|<rss\b|<feed\b|<rdf:RDF\b)/i.test(content)) {
+      if (/<!DOCTYPE|<!ENTITY/i.test(content)) throw new Error("X 订阅格式无效");
+      const doc = new DOMParser().parseFromString(content, "application/xml");
+      if (!doc.querySelector("parsererror") && Array.from(doc.querySelectorAll("item, entry")).some(item => {
+        const link = item.querySelector("link");
+        return link && isPost(link.getAttribute("href") || link.textContent.trim()) && item.querySelector("description, summary, content")?.textContent.trim();
+      })) return;
+    } else {
+      const doc = document.createElement("template"); doc.innerHTML = content;
+      if (Array.from(doc.content.querySelectorAll(".timeline-item[data-username]")).some(item =>
+        item.dataset.username.toLowerCase() === username && item.querySelector(".tweet-content")?.textContent.trim()
+        && isPost(item.querySelector(".tweet-link")?.getAttribute("href")))) return;
+    }
+    throw new Error("免费 X 来源暂无可读取的该账号动态");
+  }
+
+  async function readX(source, signal) {
+    const controller = new AbortController();
+    const abort = () => controller.abort(); signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    const timeout = setTimeout(abort, 45000);
+    const options = routes(source); let next = 0;
+    async function worker() {
+      while (next < options.length && !controller.signal.aborted) {
+        try { return await readFeed(options[next++], controller.signal); }
+        catch (error) { if (controller.signal.aborted) throw error; }
+      }
+      throw new Error("免费 X 来源暂时不可用");
+    }
+    try { return await Promise.any([worker(), worker()]); }
+    catch { throw new Error("免费 X 来源暂时不可用，可以稍后重试"); }
+    finally { abort(); clearTimeout(timeout); signal.removeEventListener("abort", abort); }
+  }
+
   async function collect({ sources, importFeed, onProgress, signal }) {
     const result = { sourceIds: [], newCount: 0, failed: [] };
     let next = 0;
@@ -118,7 +192,11 @@ window.BrowserNews = (() => {
         let content;
         let format;
         const failures = [];
-        for (const route of routes(source)) {
+        if (source.kind === "x") {
+          try { const feed = await readX(source, signal); content = feed.content; format = feed.format; }
+          catch (error) { if (signal.aborted) return; failures.push(error.message); }
+        }
+        for (const route of source.kind === "x" ? [] : routes(source)) {
           try { const feed = await readFeed(route, signal); content = feed.content; format = feed.format; break; }
           catch (error) {
             if (signal.aborted) return;

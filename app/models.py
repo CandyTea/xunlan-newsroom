@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .telegram import channel_url
+from .xfeeds import account_url
 
 Category = Literal["games", "sports", "stocks", "politics"]
 CATEGORIES = ("games", "sports", "stocks", "politics")
@@ -94,7 +95,7 @@ class Schedule(StrictModel):
 class Source(StrictModel):
     name: str = Field(min_length=1, max_length=120)
     media_name: str = Field(default="", max_length=120)
-    kind: Literal["rss", "steam", "telegram", "dongqiudi"] = "rss"
+    kind: Literal["rss", "steam", "telegram", "dongqiudi", "x"] = "rss"
     url: str = Field(default="", max_length=2048)
     category: Category
     enabled: bool = True
@@ -114,6 +115,9 @@ class Source(StrictModel):
             self.url = "https://www.dongqiudi.com/"
             self.category = "sports"
             self.steam_appid = None
+        elif self.kind == "x":
+            self.url = account_url(self.url)
+            self.steam_appid = None
         elif self.kind == "telegram":
             self.url = channel_url(self.url)
             self.steam_appid = None
@@ -121,6 +125,16 @@ class Source(StrictModel):
             self.url = public_url_syntax(self.url)
             self.steam_appid = None
         return self
+
+
+class XFollow(StrictModel):
+    account: str = Field(min_length=1, max_length=2048)
+    category: Category = "stocks"
+
+    @field_validator("account")
+    @classmethod
+    def valid_account(cls, value):
+        return account_url(value)
 
 
 class MediaFollow(StrictModel):
@@ -160,7 +174,7 @@ class FetchRequest(StrictModel):
 class BrowserFeed(StrictModel):
     source_id: int = Field(gt=0)
     source_url: str = Field(min_length=1, max_length=2048)
-    format: Literal["rss", "rss2json", "telegram"]
+    format: Literal["rss", "rss2json", "telegram", "x"]
     content: str = Field(max_length=2 * 1024 * 1024)
 
 

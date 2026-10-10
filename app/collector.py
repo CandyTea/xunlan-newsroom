@@ -369,6 +369,9 @@ def parse_source(data, source, base_url=None):
     if source["kind"] == "telegram":
         from .telegram import parse_telegram
         return parse_telegram(data, source["url"])
+    if source["kind"] == "x":
+        from .xfeeds import parse_x
+        return parse_x(data, source["url"], base_url)
     if source["kind"] == "dongqiudi":
         from .dongqiudi import list_page
         return list_page(data)[0]
@@ -398,6 +401,9 @@ class Collector:
         self.db = db
         self.fetcher = fetcher
         self.lock = asyncio.Lock()
+        self.x_locks = {}
+        self.x_slots = asyncio.Semaphore(2)
+        self.x_attempts = {}
         self.task = None
         self.run_id = None
         self.dqd_lock = asyncio.Lock()
@@ -461,7 +467,7 @@ class Collector:
                     continue
                 count += 1
                 content = article.get("content")
-                if source["kind"] == "telegram" and content:
+                if source["kind"] in ("telegram", "x") and content:
                     conn.execute("INSERT INTO article_content(article_id,source_url,paragraphs,author,fetched_at) VALUES(?,?,?,?,?)",
                                  (inserted.lastrowid, article["url"], json.dumps(content["paragraphs"], ensure_ascii=False),
                                   content["author"], utc_now()))
@@ -629,13 +635,46 @@ class Collector:
                 self.dqd_refreshed[key] = asyncio.get_running_loop().time()
             return {"new_count": count, "partial": bool(failed), "recent": False, "has_more": self.dqd_has_more(source)}
 
+    async def collect_x(self, source):
+        from .xfeeds import fetch_x
+        key = (source["id"], source["url"])
+        async with self.x_locks.setdefault(key, asyncio.Lock()):
+            with self.db.connection() as conn:
+                current = conn.execute("SELECT * FROM sources WHERE id=? AND kind='x' AND enabled=1", (source["id"],)).fetchone()
+            if current is None or current["url"] != source["url"]:
+                raise ValueError("此 X 账号已停用或改变")
+            source = dict(current)
+            key = (source["id"], source["url"])
+            now = asyncio.get_running_loop().time()
+            if source["last_success_at"] and not source["last_error"]:
+                last_success = datetime.fromisoformat(source["last_success_at"])
+                if (datetime.now(timezone.utc) - last_success).total_seconds() < 300:
+                    return {"new_count": 0, "available": True, "recent": True}
+            previous = self.x_attempts.get(key)
+            if previous and now - previous["at"] < (300 if previous["ok"] else 60):
+                return {"new_count": 0, "available": previous["ok"], "recent": True}
+            try:
+                async with asyncio.timeout(28):
+                    async with self.x_slots:
+                        articles, _ = await fetch_x(source["url"], self.fetcher)
+                count = self.persist_articles(source, articles)
+            except (ValueError, OSError, TimeoutError, httpx.HTTPError) as exc:
+                self.x_attempts[key] = {"at": now, "ok": False}
+                with self.db.connection(write=True) as conn:
+                    conn.execute("UPDATE sources SET last_error=? WHERE id=? AND kind='x' AND url=?", (safe_error(exc), source["id"], source["url"]))
+                return {"new_count": 0, "available": False, "recent": False}
+            self.x_attempts[key] = {"at": asyncio.get_running_loop().time(), "ok": True}
+            return {"new_count": count, "available": True, "recent": False}
+
     async def collect(self, run_id, categories, *, failed_only=False, skip_source_ids=()):
         new_count = 0
         errors = []
         attempted = 0
         try:
             with self.db.connection() as conn:
-                sources = [dict(row) for row in conn.execute("SELECT * FROM sources WHERE enabled=1")
+                sources = [dict(row) for row in conn.execute("""SELECT * FROM sources s WHERE enabled=1 AND (kind!='x'
+                    OR EXISTS(SELECT 1 FROM media_follows f WHERE f.media_id=s.media_id AND (f.reader_id='owner'
+                        OR EXISTS(SELECT 1 FROM guest_sessions g WHERE g.token_hash=f.reader_id AND g.expires_at>?))))""", (utc_now(),))
                            if row["category"] in categories and row["id"] not in skip_source_ids]
             semaphore = asyncio.Semaphore(3)
 
@@ -655,6 +694,12 @@ class Collector:
                     return
                 attempted += 1
                 try:
+                    if source["kind"] == "x":
+                        result = await self.collect_x(source)
+                        new_count += result["new_count"]
+                        if not result["available"]:
+                            raise ValueError("免费 X 来源暂时不可用，可稍后重试")
+                        return
                     if source["kind"] == "dongqiudi":
                         result = await self.collect_dongqiudi(source)
                         new_count += result["new_count"]

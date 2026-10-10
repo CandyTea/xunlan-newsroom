@@ -31,6 +31,7 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const main = $("#main-content");
 const modal = $("#modal");
 const deviceNews = { busy: false, lastAttempt: 0, controller: null, pending: null };
+const xNews = { controller: null, busy: false, attempts: new Map() };
 const listTranslation = { controller: null, retryAfter: 0 };
 const streamNews = { observer: null, controller: null, busy: false, cursor: null, hasMore: false, manualMore: false, error: "" };
 const historyNews = { controller: null, busy: false };
@@ -165,6 +166,7 @@ async function confirmDelete(title, copy, action) {
 }
 
 function showAuth() {
+  xNews.controller?.abort();
   deviceNews.controller?.abort();
   listTranslation.controller?.abort();
   deviceNews.lastAttempt = 0;
@@ -194,6 +196,7 @@ async function refreshData() {
   renderSidebar(); updateFetchButtons();
 }
 async function enterApp() {
+  xNews.controller?.abort(); xNews.controller = null; xNews.busy = false; xNews.attempts.clear();
   deviceNews.controller?.abort(); listTranslation.controller?.abort(); historyNews.controller?.abort(); stopStream(); closeModal();
   dqdNews.controller?.abort(); dqdNews.moreController?.abort(); Object.assign(dqdNews, { options: null, filters: { team: "", player: "", author: "", from: "", to: "" }, controller: null, busy: false, started: false, moreBusy: false, moreController: null, hasMore: true });
   state.renderId += 1; state.articles = []; state.watches = []; state.media = []; state.mediaId = ""; state.schedules = []; state.status = {};
@@ -399,6 +402,7 @@ function mediaFollowButton(media) {
       if (index >= 0) state.media[index] = updated; else state.media.push(updated);
       renderSidebar(); toast(updated.followed ? `已关注${updated.name}` : `已取消关注${updated.name}`);
       if (id === state.renderId) await renderView();
+      if (updated.followed && updated.x_supported) refreshXMedia(updated.id, true);
     } catch (error) { showError(error); }
     finally { control.disabled = false; }
   }, media.followed ? "button button-small" : "button button-small button-primary", null, { "aria-pressed": String(media.followed), "aria-label": `${media.followed ? "取消关注" : "关注"}${media.name}` });
@@ -407,14 +411,14 @@ function mediaFollowButton(media) {
 async function renderMediaList(id) {
   listTranslation.controller?.abort(); state.articles = [];
   const content = el("div", { class: "media-directory", "aria-live": "polite" }, loading("正在载入媒体…"));
-  main.replaceChildren(heading("我的关注", "关注媒体，集中阅读它的消息。"), followingTabs(), content);
+  main.replaceChildren(heading("我的关注", "关注媒体与 X 账号，集中阅读它们的消息。", [button("关注 X 账号", xFollowForm, "button button-small", "plus")]), followingTabs(), content);
   try {
     const data = await api("/media"); if (id !== state.renderId) return;
     state.media = data.items || []; renderSidebar();
     const followed = state.media.filter(media => media.followed);
     const available = state.media.filter(media => !media.followed);
     const row = media => el("article", { class: "media-row" }, [
-      el("div", { class: "media-copy" }, [el("h3", {}, button(media.name, () => openMedia(media.id), "media-name")), el("p", { text: `${media.article_count} 条资讯${media.source_count ? ` · ${media.source_count} 个订阅` : ""}` })]),
+      el("div", { class: "media-copy" }, [el("h3", {}, button(media.name, () => openMedia(media.id), "media-name")), el("p", { text: `${media.x_account ? new URL(media.x_account).pathname.replace("/", "@") + " · " : ""}${media.article_count} 条资讯${media.source_count ? ` · ${media.source_count} 个订阅` : ""}` })]),
       el("div", { class: "media-actions" }, [button("查看消息", () => openMedia(media.id), "button button-small"), mediaFollowButton(media)]),
     ]);
     const group = (title, items) => el("section", { class: "media-group" }, [el("h2", { text: title }), el("div", { class: "media-list" }, items.map(row))]);
@@ -423,6 +427,72 @@ async function renderMediaList(id) {
     if (!state.media.length) content.replaceChildren(empty("还没有可浏览的媒体", "配置资讯来源后，媒体会出现在这里。"));
   } catch (error) { if (id === state.renderId && error.status !== 401) content.replaceChildren(errorPanel(error, renderView)); }
 }
+function xFollowForm() {
+  const account = input("account", "", { required: true, maxlength: 2048, placeholder: "@elonmusk 或 https://x.com/thsottiaux", autocomplete: "off", autocapitalize: "none", spellcheck: "false" });
+  const form = el("form", { class: "modal-form" }, [
+    formField("X 账号 / 主页链接", account, "关注公开账号，无需 X 密码或 API Key。"),
+    el("div", { class: "x-presets" }, [button("马斯克", () => { account.value = "@elonmusk"; account.focus(); }, "button button-small"), button("Tibo · OpenAI", () => { account.value = "@thsottiaux"; account.focus(); }, "button button-small")]),
+    formField("归入栏目", select("category", CATEGORIES, "stocks"), "新账号会归入所选栏目，按该栏目的收取计划更新。"),
+    formFooter("关注账号"),
+  ]);
+  form.addEventListener("submit", async event => {
+    event.preventDefault(); const submit = $("[type=submit]", form); submit.disabled = true;
+    const session = state.session, modalId = state.modalId;
+    try {
+      const media = await api("/x/follow", { method: "POST", body: { account: account.value.trim(), category: $("[name=category]", form).value } });
+      if (session !== state.session) return;
+      const index = state.media.findIndex(item => item.id === media.id);
+      if (index >= 0) state.media[index] = media; else state.media.push(media);
+      renderSidebar();
+      if (modalId === state.modalId && modal.open) { closeModal(); openMedia(media.id); }
+      toast(`已关注${media.name}`); refreshXMedia(media.id, true);
+    } catch (error) { if (session === state.session && modalId === state.modalId && modal.open) modalError(form, error); }
+    finally { submit.disabled = false; }
+  });
+  openModal("关注 X 账号", form); account.focus();
+}
+function xRefreshButton(media) {
+  return media?.x_supported ? button(xNews.busy ? "正在更新…" : "更新动态", () => refreshXMedia(media.id), "button button-small", "refresh", { disabled: xNews.busy, "data-x-refresh": true }) : null;
+}
+function syncXRefreshButtons() {
+  document.querySelectorAll("[data-x-refresh]").forEach(node => { node.disabled = xNews.busy; node.textContent = xNews.busy ? "正在更新…" : "更新动态"; });
+}
+async function refreshXMedia(mediaId, automatic = false) {
+  if (!canRead() || xNews.busy || (automatic && Date.now() - (xNews.attempts.get(String(mediaId)) || 0) < 5 * 60000)) return;
+  const session = state.session;
+  const controller = new AbortController();
+  xNews.controller = controller; xNews.busy = true; xNews.attempts.set(String(mediaId), Date.now()); syncXRefreshButtons();
+  try {
+    const server = api(`/media/${mediaId}/x/refresh`, { method: "POST", body: {}, signal: controller.signal });
+    const device = (async () => {
+      const data = await api(`/browser/sources?media_id=${Number(mediaId)}`, { signal: controller.signal });
+      const sources = data.items.filter(source => source.kind === "x");
+      return BrowserNews.collect({ sources, signal: controller.signal, importFeed: body => {
+        if (controller.signal.aborted || state.session !== session) throw new Error("收取已取消");
+        return api("/browser/import", { method: "POST", body, signal: controller.signal });
+      } });
+    })();
+    const results = await Promise.allSettled([server, device]);
+    if (controller.signal.aborted || state.session !== session) return;
+    const backend = results[0].status === "fulfilled" ? results[0].value : null;
+    const browser = results[1].status === "fulfilled" ? results[1].value : null;
+    const count = (backend?.new_count || 0) + (browser?.newCount || 0);
+    const available = backend?.available || browser?.sourceIds.length;
+    if (!automatic) toast(count ? `新增 ${count} 条动态` : available ? "动态已更新，暂无新消息" : "暂时无法更新这个账号，可以稍后重试");
+    await refreshData();
+    if (state.session !== session) return;
+    if (String(mediaId) === state.mediaId && !modal.open && !document.hidden) {
+      await refreshReaderNews();
+      if (!available && !state.articles.length) $("#reader-list")?.append(el("p", { class: "dqd-update-message", role: "status", text: "暂时未能更新这个账号，可以点击“更新动态”重试。" }));
+    } else if (state.view === "following" && state.followingMode === "media" && !state.mediaId && !modal.open && !document.hidden) await renderMediaList(++state.renderId);
+  } catch (error) { if (!automatic && !controller.signal.aborted && state.session === session) showError(error); }
+  finally { if (xNews.controller === controller) {
+    xNews.controller = null; xNews.busy = false; syncXRefreshButtons();
+    const current = state.media.find(media => String(media.id) === state.mediaId);
+    if (!controller.signal.aborted && state.session === session && current?.x_supported && String(mediaId) !== state.mediaId) refreshXMedia(current.id, true);
+  } }
+}
+
 function dqdRefreshButton() {
   return button(dqdNews.busy ? "正在更新…" : "更新资讯", () => refreshDongqiudi(), "button button-small", "refresh", { disabled: dqdNews.busy || dqdNews.moreBusy || dqdNews.options?.enabled === false, "data-dqd-refresh": true });
 }
@@ -556,6 +626,8 @@ function dqdFilterForm() {
 }
 function readerEmpty() {
   if (state.view === "dongqiudi") return empty("暂无符合条件的懂球帝资讯", Object.values(dqdNews.filters).some(Boolean) || state.q || state.saved || state.unread ? "可以继续加载更早新闻查找，也可以调整或清除筛选。" : "公开新闻收取后会显示在这里，正文可直接在本站阅读。", [dqdRefreshButton(), dqdMoreButton(), button("清除筛选", clearFilters, "button button-small")].filter(Boolean));
+  const xMedia = state.media.find(media => String(media.id) === state.mediaId && media.x_supported);
+  if (xMedia) return empty("暂无符合条件的账号动态", state.q || state.saved || state.unread || state.category ? "可以清除筛选，查看这个账号已收取的动态。" : "收取到的公开动态会显示在这里，也可以点击更新。", [xRefreshButton(xMedia), button("清除筛选", clearFilters, "button button-small")]);
   if (state.mediaId) return empty("这个媒体暂无符合条件的资讯", state.q || state.saved || state.unread || state.category ? "可以清除筛选，查看这个媒体已收取的全部消息。" : "收取新资讯后，这个媒体的消息会显示在这里。", [button("收取资讯", () => requestFetch(), "button button-primary", "refresh"), button("清除筛选", clearFilters, "button button-small")]);
   if (state.category === "sports" && !state.q && !state.saved && !state.unread) return empty("还没有符合条件的体育资讯", "尚未收取到相关报道。可以收取新资讯，或清除联赛与球队筛选后查看全部报道。", [button("收取资讯", () => requestFetch(), "button button-primary", "refresh"), button("清除筛选", clearFilters, "button button-small")]);
   if (state.q || state.saved || state.unread || state.watchId || state.category || (state.view === "news" && (state.companyId || state.leagueId || state.teamId || state.sportsWatchId))) return empty("还没有符合条件的资讯", "试试其他栏目、公司或球队，也可以清除筛选查看已收取的全部资讯。", [button("清除筛选", clearFilters, "button button-small")]);
@@ -743,7 +815,7 @@ async function renderReader(id, quiet = false) {
   }
   const following = state.view === "following" && !publisher;
   const subtitle = following ? "从已收取的资讯中，找到你关心的人和事。" : "按栏目阅读，按兴趣关注。";
-  const head = dongqiudi ? heading("懂球帝", "集中阅读体育新闻，筛选你关心的球队、球员和作者。", [dqdRefreshButton(), dqdMoreButton()]) : publisher ? heading(media.name, "这个媒体已收取的全部消息，按发布时间排序。", [button("返回媒体", () => { location.hash = "following/media"; }, "button"), historyButton(), mediaFollowButton(media)]) : heading(following ? "我的关注" : "今日资讯", subtitle, following ? [button("管理关注", showWatchManager, "button", "edit")] : [button("关注媒体", () => { location.hash = "following/media"; }, "button")]);
+  const head = dongqiudi ? heading("懂球帝", "集中阅读体育新闻，筛选你关心的球队、球员和作者。", [dqdRefreshButton(), dqdMoreButton()]) : publisher ? heading(media.name, media.x_supported ? "这个账号已收取的公开动态，按发布时间排序。" : "这个媒体已收取的全部消息，按发布时间排序。", [button("返回媒体", () => { location.hash = "following/media"; }, "button"), xRefreshButton(media), historyButton(), mediaFollowButton(media)]) : heading(following ? "我的关注" : "今日资讯", subtitle, following ? [button("管理关注", showWatchManager, "button", "edit")] : [button("关注媒体", () => { location.hash = "following/media"; }, "button")]);
   if (publisher) document.title = `${media.name} · 讯览`;
   const categories = el("nav", { class: "category-tabs", "aria-label": "资讯栏目" }, Object.entries({ "": "全部", ...CATEGORIES }).map(([key, name]) => button(name, () => setFilter("category", key), "", null, { "aria-pressed": String(state.category === key) })));
   const search = el("form", { class: "search-form", role: "search", onsubmit: event => { event.preventDefault(); setFilter("q", $("input", search).value.trim()); } }, [input("q", state.q, { type: "search", placeholder: "搜索标题与摘要", "aria-label": "搜索资讯", maxlength: 200 }), el("button", { class: "icon-button", type: "submit", "aria-label": "搜索" }, icon("search"))]);
@@ -774,6 +846,7 @@ async function renderReader(id, quiet = false) {
       list.replaceChildren(readerEmpty());
       const historyControl = historyButton(); if (historyControl) list.append(el("div", { class: "reader-more-actions" }, historyControl));
       if (dongqiudi && !dqdNews.started && dqdNews.options?.enabled) refreshDongqiudi(true);
+      if (media?.x_supported) refreshXMedia(media.id, true);
       return;
     }
     list.replaceChildren(el("div", { class: "list-meta" }, [el("span", { id: "reader-count", text: `共 ${state.total} 条${following ? "关注" : ""}资讯` }), el("span", { text: "按发布时间排序" }), button("有更新，点击刷新", () => { renderView(); window.scrollTo({ top: 0, behavior: "instant" }); }, "reader-update", null, { id: "reader-update", hidden: true })]), el("div", { class: "news-list" }, state.articles.map(articleRow)));
@@ -787,6 +860,7 @@ async function renderReader(id, quiet = false) {
     if (quiet) window.scrollTo({ top: scrollY, behavior: "instant" });
     autoTranslateList(id);
     if (dongqiudi && !dqdNews.started && dqdNews.options?.enabled) refreshDongqiudi(true);
+    if (media?.x_supported) refreshXMedia(media.id, true);
   } catch (error) { if (!quiet && id === state.renderId && error.status !== 401) list.replaceChildren(errorPanel(error, renderView)); }
 }
 function changePage(delta) {
