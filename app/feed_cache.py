@@ -42,7 +42,7 @@ async def build_cache(output):
                 try:
                     if source["kind"] == "x":
                         articles, data = await fetch_x(source["url"])
-                        route = "x-public-mirror"
+                        route = "x-public-page"
                     else:
                         data, base_url = await fetch_public(source["url"])
                         articles = parse_source(data, source, base_url)

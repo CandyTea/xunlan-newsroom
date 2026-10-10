@@ -31,7 +31,7 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const main = $("#main-content");
 const modal = $("#modal");
 const deviceNews = { busy: false, lastAttempt: 0, controller: null, pending: null };
-const xNews = { controller: null, busy: false, attempts: new Map() };
+const xNews = { controller: null, busy: false, attempts: new Map(), statuses: new Map() };
 const listTranslation = { controller: null, retryAfter: 0 };
 const streamNews = { observer: null, controller: null, busy: false, cursor: null, hasMore: false, manualMore: false, error: "" };
 const historyNews = { controller: null, busy: false };
@@ -196,7 +196,7 @@ async function refreshData() {
   renderSidebar(); updateFetchButtons();
 }
 async function enterApp() {
-  xNews.controller?.abort(); xNews.controller = null; xNews.busy = false; xNews.attempts.clear();
+  xNews.controller?.abort(); xNews.controller = null; xNews.busy = false; xNews.attempts.clear(); xNews.statuses.clear();
   deviceNews.controller?.abort(); listTranslation.controller?.abort(); historyNews.controller?.abort(); stopStream(); closeModal();
   dqdNews.controller?.abort(); dqdNews.moreController?.abort(); Object.assign(dqdNews, { options: null, filters: { team: "", player: "", author: "", from: "", to: "" }, controller: null, busy: false, started: false, moreBusy: false, moreController: null, hasMore: true });
   state.renderId += 1; state.articles = []; state.watches = []; state.media = []; state.mediaId = ""; state.schedules = []; state.status = {};
@@ -456,40 +456,47 @@ function xRefreshButton(media) {
 }
 function syncXRefreshButtons() {
   document.querySelectorAll("[data-x-refresh]").forEach(node => { node.disabled = xNews.busy; node.textContent = xNews.busy ? "正在更新…" : "更新动态"; });
+  const panel = $("#reader-list [data-x-empty]");
+  if (panel?.dataset.xEmpty === state.mediaId) panel.replaceWith(readerEmpty());
 }
 async function refreshXMedia(mediaId, automatic = false) {
   if (!canRead() || xNews.busy || (automatic && Date.now() - (xNews.attempts.get(String(mediaId)) || 0) < 5 * 60000)) return;
   const session = state.session;
   const controller = new AbortController();
+  let finished = false;
+  xNews.statuses.set(String(mediaId), "updating");
   xNews.controller = controller; xNews.busy = true; xNews.attempts.set(String(mediaId), Date.now()); syncXRefreshButtons();
   try {
     const server = api(`/media/${mediaId}/x/refresh`, { method: "POST", body: {}, signal: controller.signal });
     const device = (async () => {
       const data = await api(`/browser/sources?media_id=${Number(mediaId)}`, { signal: controller.signal });
       const sources = data.items.filter(source => source.kind === "x");
-      return BrowserNews.collect({ sources, signal: controller.signal, importFeed: body => {
+      const collected = await BrowserNews.collect({ sources, signal: controller.signal, importFeed: body => {
         if (controller.signal.aborted || state.session !== session) throw new Error("收取已取消");
         return api("/browser/import", { method: "POST", body, signal: controller.signal });
       } });
+      return { new_count: collected.newCount, available: Boolean(collected.sourceIds.length) };
     })();
-    const results = await Promise.allSettled([server, device]);
+    const result = await Promise.any([server, device].map(request => request.then(value => {
+      if (!value.available) throw new Error("未取得账号动态");
+      return value;
+    }))).catch(() => ({ available: false, new_count: 0 }));
     if (controller.signal.aborted || state.session !== session) return;
-    const backend = results[0].status === "fulfilled" ? results[0].value : null;
-    const browser = results[1].status === "fulfilled" ? results[1].value : null;
-    const count = (backend?.new_count || 0) + (browser?.newCount || 0);
-    const available = backend?.available || browser?.sourceIds.length;
+    finished = true;
+    const { available, new_count: count } = result;
+    xNews.statuses.set(String(mediaId), available ? "ready" : "failed");
+    controller.abort();
     if (!automatic) toast(count ? `新增 ${count} 条动态` : available ? "动态已更新，暂无新消息" : "暂时无法更新这个账号，可以稍后重试");
     await refreshData();
     if (state.session !== session) return;
     if (String(mediaId) === state.mediaId && !modal.open && !document.hidden) {
       await refreshReaderNews();
-      if (!available && !state.articles.length) $("#reader-list")?.append(el("p", { class: "dqd-update-message", role: "status", text: "暂时未能更新这个账号，可以点击“更新动态”重试。" }));
     } else if (state.view === "following" && state.followingMode === "media" && !state.mediaId && !modal.open && !document.hidden) await renderMediaList(++state.renderId);
-  } catch (error) { if (!automatic && !controller.signal.aborted && state.session === session) showError(error); }
+  } catch (error) { if (!automatic && (finished || !controller.signal.aborted) && state.session === session) showError(error); }
   finally { if (xNews.controller === controller) {
     xNews.controller = null; xNews.busy = false; syncXRefreshButtons();
     const current = state.media.find(media => String(media.id) === state.mediaId);
-    if (!controller.signal.aborted && state.session === session && current?.x_supported && String(mediaId) !== state.mediaId) refreshXMedia(current.id, true);
+    if ((finished || !controller.signal.aborted) && state.session === session && current?.x_supported && String(mediaId) !== state.mediaId) refreshXMedia(current.id, true);
   } }
 }
 
@@ -627,7 +634,15 @@ function dqdFilterForm() {
 function readerEmpty() {
   if (state.view === "dongqiudi") return empty("暂无符合条件的懂球帝资讯", Object.values(dqdNews.filters).some(Boolean) || state.q || state.saved || state.unread ? "可以继续加载更早新闻查找，也可以调整或清除筛选。" : "公开新闻收取后会显示在这里，正文可直接在本站阅读。", [dqdRefreshButton(), dqdMoreButton(), button("清除筛选", clearFilters, "button button-small")].filter(Boolean));
   const xMedia = state.media.find(media => String(media.id) === state.mediaId && media.x_supported);
-  if (xMedia) return empty("暂无符合条件的账号动态", state.q || state.saved || state.unread || state.category ? "可以清除筛选，查看这个账号已收取的动态。" : "收取到的公开动态会显示在这里，也可以点击更新。", [xRefreshButton(xMedia), button("清除筛选", clearFilters, "button button-small")]);
+  if (xMedia) {
+    const status = xNews.statuses.get(state.mediaId);
+    const filtered = xMedia.article_count > 0 && (state.q || state.saved || state.unread || state.category || state.page > 1);
+    const title = filtered ? "暂无符合条件的账号动态" : status === "updating" ? "正在收取账号动态…" : status === "failed" ? "暂时无法取得账号动态" : "尚未收取到账号动态";
+    const copy = filtered ? "可以清除筛选，查看这个账号已收取的动态。" : status === "updating" ? "取得公开动态后会自动显示。" : status === "failed" ? "本次更新未取得可读取的内容，可以点击“更新动态”重试。" : "打开账号页会自动更新，也可以点击“更新动态”。";
+    const panel = empty(title, copy, [xRefreshButton(xMedia), filtered && button("清除筛选", clearFilters, "button button-small")].filter(Boolean));
+    panel.dataset.xEmpty = state.mediaId;
+    return panel;
+  }
   if (state.mediaId) return empty("这个媒体暂无符合条件的资讯", state.q || state.saved || state.unread || state.category ? "可以清除筛选，查看这个媒体已收取的全部消息。" : "收取新资讯后，这个媒体的消息会显示在这里。", [button("收取资讯", () => requestFetch(), "button button-primary", "refresh"), button("清除筛选", clearFilters, "button button-small")]);
   if (state.category === "sports" && !state.q && !state.saved && !state.unread) return empty("还没有符合条件的体育资讯", "尚未收取到相关报道。可以收取新资讯，或清除联赛与球队筛选后查看全部报道。", [button("收取资讯", () => requestFetch(), "button button-primary", "refresh"), button("清除筛选", clearFilters, "button button-small")]);
   if (state.q || state.saved || state.unread || state.watchId || state.category || (state.view === "news" && (state.companyId || state.leagueId || state.teamId || state.sportsWatchId))) return empty("还没有符合条件的资讯", "试试其他栏目、公司或球队，也可以清除筛选查看已收取的全部资讯。", [button("清除筛选", clearFilters, "button button-small")]);
@@ -815,7 +830,7 @@ async function renderReader(id, quiet = false) {
   }
   const following = state.view === "following" && !publisher;
   const subtitle = following ? "从已收取的资讯中，找到你关心的人和事。" : "按栏目阅读，按兴趣关注。";
-  const head = dongqiudi ? heading("懂球帝", "集中阅读体育新闻，筛选你关心的球队、球员和作者。", [dqdRefreshButton(), dqdMoreButton()]) : publisher ? heading(media.name, media.x_supported ? "这个账号已收取的公开动态，按发布时间排序。" : "这个媒体已收取的全部消息，按发布时间排序。", [button("返回媒体", () => { location.hash = "following/media"; }, "button"), xRefreshButton(media), historyButton(), mediaFollowButton(media)]) : heading(following ? "我的关注" : "今日资讯", subtitle, following ? [button("管理关注", showWatchManager, "button", "edit")] : [button("关注媒体", () => { location.hash = "following/media"; }, "button")]);
+  const head = dongqiudi ? heading("懂球帝", "集中阅读体育新闻，筛选你关心的球队、球员和作者。", [dqdRefreshButton(), dqdMoreButton()]) : publisher ? heading(media.name, media.x_supported ? "按发布时间阅读已收取的公开动态；公开来源可能仅提供部分帖子。" : "这个媒体已收取的全部消息，按发布时间排序。", [button("返回媒体", () => { location.hash = "following/media"; }, "button"), xRefreshButton(media), historyButton(), mediaFollowButton(media)]) : heading(following ? "我的关注" : "今日资讯", subtitle, following ? [button("管理关注", showWatchManager, "button", "edit")] : [button("关注媒体", () => { location.hash = "following/media"; }, "button")]);
   if (publisher) document.title = `${media.name} · 讯览`;
   const categories = el("nav", { class: "category-tabs", "aria-label": "资讯栏目" }, Object.entries({ "": "全部", ...CATEGORIES }).map(([key, name]) => button(name, () => setFilter("category", key), "", null, { "aria-pressed": String(state.category === key) })));
   const search = el("form", { class: "search-form", role: "search", onsubmit: event => { event.preventDefault(); setFilter("q", $("input", search).value.trim()); } }, [input("q", state.q, { type: "search", placeholder: "搜索标题与摘要", "aria-label": "搜索资讯", maxlength: 200 }), el("button", { class: "icon-button", type: "submit", "aria-label": "搜索" }, icon("search"))]);

@@ -1,6 +1,7 @@
-"""Read public X timelines through free RSS and HTML mirrors."""
+"""Read public X posts from embedded profiles and optional free mirrors."""
 import asyncio
 import html as text_html
+import json
 import os
 import re
 import textwrap
@@ -11,9 +12,8 @@ from urllib.parse import unquote, urljoin, urlsplit
 import httpx
 from lxml import etree, html
 
-DEFAULT_MIRRORS = (
-    "https://nitter.poast.org", "https://nitter.privacyredirect.com", "https://nitter.catsarch.com",
-)
+DEFAULT_MIRRORS = ("https://nitter.poast.org",)
+EMBED_ORIGIN = "https://syndication.twitter.com"
 X_HOSTS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}
 PRESETS = {"elonmusk": "马斯克", "thsottiaux": "Tibo · OpenAI"}
 
@@ -54,8 +54,10 @@ def mirror_urls():
 
 def source_routes(source_url):
     username = urlsplit(account_url(source_url)).path.strip("/")
-    return [{"url": mirror + "/" + username + suffix, "format": "x"}
-            for suffix in ("/rss", "") for mirror in mirror_urls()]
+    return [{"url": EMBED_ORIGIN + "/srv/timeline-profile/screen-name/" + username, "format": "x"}] + [
+        {"url": mirror + "/" + username + suffix, "format": "x"}
+        for suffix in ("/rss", "") for mirror in mirror_urls()
+    ]
 
 
 def post_url(value, username, base_url):
@@ -70,7 +72,7 @@ def post_url(value, username, base_url):
     return f"https://x.com/{username}/status/{match[2]}"
 
 
-def document(data):
+def document(data, *, keep_timeline_data=False):
     try:
         root = html.fromstring(data, parser=html.HTMLParser(no_network=True))
     except (etree.ParserError, ValueError) as exc:
@@ -78,6 +80,8 @@ def document(data):
     if root.tag in ("script", "style", "noscript"):
         root.clear()
     for node in root.xpath("//script|//style|//noscript"):
+        if keep_timeline_data and node.tag == "script" and node.get("id") == "__NEXT_DATA__" and node.get("type") == "application/json":
+            continue
         node.drop_tree()
     return root
 
@@ -107,12 +111,63 @@ def make_post(url, content, published, username, image=None):
     return article
 
 
+def embedded_posts(root, username):
+    scripts = root.xpath('//script[@id="__NEXT_DATA__" and @type="application/json"]/text()')
+    if not scripts:
+        return None
+    try:
+        payload = json.loads(scripts[0])
+        entries = payload["props"]["pageProps"]["timeline"]["entries"]
+    except (ValueError, KeyError, TypeError, RecursionError) as exc:
+        raise ValueError("X 公开页面未返回有效动态数据") from exc
+    if not isinstance(entries, list) or len(entries) > 200:
+        raise ValueError("X 公开页面动态数量无效")
+    articles = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "tweet":
+            continue
+        content = entry.get("content")
+        tweet = content.get("tweet") if isinstance(content, dict) else None
+        if not isinstance(tweet, dict):
+            continue
+        user = tweet.get("user")
+        if not isinstance(user, dict):
+            continue
+        screen_name = user.get("screen_name")
+        if not isinstance(screen_name, str) or screen_name.lower() != username or user.get("protected"):
+            continue
+        post_id = tweet.get("id_str")
+        text = tweet.get("full_text") or tweet.get("text")
+        if not isinstance(post_id, str) or not isinstance(text, str) or not text.strip():
+            continue
+        url = post_url(f"https://x.com/{username}/status/{post_id}", username, "https://x.com/")
+        permalink = tweet.get("permalink")
+        if not url or url in seen or (permalink and (not isinstance(permalink, str) or post_url(permalink, username, "https://x.com/") != url)):
+            continue
+        # Treat JSON text as text; never render or execute the page's scripts.
+        body = paragraphs(document(text_html.escape(text_html.unescape(text))))
+        published = None
+        created = tweet.get("created_at")
+        if isinstance(created, str):
+            try:
+                published = datetime.strptime(created, "%a %b %d %H:%M:%S %z %Y").isoformat()
+            except ValueError:
+                pass
+        article = make_post(url, body, published, username)
+        if article:
+            articles.append(article)
+            seen.add(url)
+    return articles
+
+
 def parse_x(data, source_url, base_url=None):
     from .collector import MAX_BYTES, _child_text, _local
     if isinstance(data, str):
         data = data.encode("utf-8")
     if len(data) > MAX_BYTES:
         raise ValueError("免费 X 来源超过 2 MB 上限")
+    data = data.removeprefix(b"\xef\xbb\xbf")
     username = urlsplit(account_url(source_url)).path.strip("/")
     base_url = base_url or mirror_urls()[0] + "/" + username
     articles = []
@@ -145,8 +200,12 @@ def parse_x(data, source_url, base_url=None):
             if len(articles) >= 100:
                 break
     else:
-        root = document(data)
-        for node in root.xpath("//*[contains(concat(' ',normalize-space(@class),' '),' timeline-item ')]")[:200]:
+        root = document(data, keep_timeline_data=True)
+        embedded = embedded_posts(root, username)
+        if embedded is not None:
+            articles = embedded
+        timeline_nodes = [] if embedded is not None else root.xpath("//*[contains(concat(' ',normalize-space(@class),' '),' timeline-item ')]")
+        for node in timeline_nodes[:200]:
             if node.get("data-username", "").lower() != username:
                 continue
             bodies = node.xpath(".//*[contains(concat(' ',normalize-space(@class),' '),' tweet-content ')]")

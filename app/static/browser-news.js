@@ -38,12 +38,13 @@ window.BrowserNews = (() => {
       }
       if (route.format === "article") return { content };
       let format = route.format;
-      if (route.format === "telegram-reader") {
+      if (route.format === "telegram-reader" || route.format === "x-reader") {
         const payload = JSON.parse(content);
-        if (payload.code !== 200 || typeof payload.data?.content !== "string" || payload.data.warning) throw new Error("频道读取服务未返回有效页面");
-        content = payload.data.content;
-        if (new TextEncoder().encode(content).byteLength > MAX_BYTES) throw new Error("频道页面超过 2 MB");
-        format = "telegram";
+        const page = payload.data?.html || payload.data?.content;
+        if (payload.code !== 200 || typeof page !== "string" || payload.data.warning) throw new Error("公开页面读取服务未返回有效页面");
+        content = page;
+        if (new TextEncoder().encode(content).byteLength > MAX_BYTES) throw new Error("公开页面超过 2 MB");
+        format = route.format === "x-reader" ? "x" : "telegram";
       }
       if (route.format === "cache") {
         const data = JSON.parse(content);
@@ -69,7 +70,7 @@ window.BrowserNews = (() => {
         content = new XMLSerializer().serializeToString(doc); format = "x";
       }
       if (format === "x") {
-        validateXContent(content, route.sourceUrl);
+        validateXContent(content, route.sourceUrl, route.postHosts);
         return { content, format: "x" };
       }
       if (format === "telegram") {
@@ -108,8 +109,14 @@ window.BrowserNews = (() => {
     const encoded = encodeURIComponent(source.url);
     if (source.kind === "x") {
       const mirrors = source.routes || [];
+      const official = mirrors.find(route => new URL(route.url).hostname === "syndication.twitter.com");
       const rss = mirrors.filter(route => new URL(route.url).pathname.endsWith("/rss"));
       const options = [
+        ...(official ? [
+          { name: "X 公开账号页面", url: `https://api.allorigins.win/raw?url=${encodeURIComponent(official.url)}`, sourceUrl: source.url, format: "x", timeout: 10000 },
+          { name: "X 公开页面读取", url: `https://r.jina.ai/${official.url}`, sourceUrl: source.url, format: "x-reader", timeout: 20000,
+            headers: { Accept: "application/json", "X-Respond-With": "html" } },
+        ] : []),
         ...rss.flatMap(route => [
           { name: "公开 X RSS", url: route.url, sourceUrl: source.url, format: "x", timeout: 4000 },
           { name: "X RSS 转换", url: `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(route.url)}`, sourceUrl: source.url, format: "x-json", timeout: 8000 },
@@ -118,7 +125,8 @@ window.BrowserNews = (() => {
         ]),
       ];
       if (source.cache_url) options.unshift({ name: "GitHub 动态缓存", url: source.cache_url, sourceUrl: source.url, format: "cache", expectedFormat: "x", timeout: 8000 });
-      return options;
+      const postHosts = rss.map(route => new URL(route.url).hostname);
+      return options.map(route => ({ ...route, postHosts }));
     }
     if (source.kind === "telegram") {
       const options = [
@@ -139,13 +147,15 @@ window.BrowserNews = (() => {
     return options;
   }
 
-  function validateXContent(content, sourceUrl) {
+  function validateXContent(content, sourceUrl, postHosts = []) {
     const username = new URL(sourceUrl).pathname.slice(1).toLowerCase();
+    const allowedHosts = new Set(["x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com", ...postHosts]);
     const isPost = value => {
       try {
         const url = new URL(value, sourceUrl);
         const match = /^\/([A-Za-z0-9_]{1,15})\/status\/([1-9][0-9]{0,19})\/?$/.exec(url.pathname);
-        return Boolean(match && match[1].toLowerCase() === username && BigInt(match[2]) <= 9223372036854775807n);
+        return Boolean(["http:", "https:"].includes(url.protocol) && allowedHosts.has(url.hostname) && !url.username && !url.password && !url.port
+          && match && match[1].toLowerCase() === username && BigInt(match[2]) <= 9223372036854775807n);
       } catch { return false; }
     };
     if (/^\s*(?:<\?xml\b|<rss\b|<feed\b|<rdf:RDF\b)/i.test(content)) {
@@ -157,6 +167,21 @@ window.BrowserNews = (() => {
       })) return;
     } else {
       const doc = document.createElement("template"); doc.innerHTML = content;
+      const data = doc.content.querySelector('script#__NEXT_DATA__[type="application/json"]');
+      if (data) {
+        const payload = JSON.parse(data.textContent);
+        const entries = payload?.props?.pageProps?.timeline?.entries;
+        if (Array.isArray(entries) && entries.length <= 200 && entries.some(entry => {
+          const tweet = entry?.type === "tweet" && entry.content?.tweet;
+          const text = tweet?.full_text || tweet?.text;
+          const id = tweet?.id_str;
+          return typeof tweet?.user?.screen_name === "string" && tweet.user.screen_name.toLowerCase() === username && !tweet.user.protected
+            && typeof id === "string" && isPost(`https://x.com/${username}/status/${id}`) && typeof text === "string" && text.trim()
+            && (!tweet.permalink || (typeof tweet.permalink === "string" && isPost(tweet.permalink)
+              && new URL(tweet.permalink, sourceUrl).pathname.replace(/\/$/, "").toLowerCase() === `/${username}/status/${id}`));
+        })) return;
+        throw new Error("X 公开页面未返回这个账号的有效动态");
+      }
       if (Array.from(doc.content.querySelectorAll(".timeline-item[data-username]")).some(item =>
         item.dataset.username.toLowerCase() === username && item.querySelector(".tweet-content")?.textContent.trim()
         && isPost(item.querySelector(".tweet-link")?.getAttribute("href")))) return;
