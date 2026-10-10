@@ -112,6 +112,18 @@ class ArticleReader:
             if cached:
                 return cached
             try:
+                from .dongqiudi import DETAIL_URL, RestrictedArticle, detail_page, public_article_id
+                dqd_id = public_article_id(article["url"])
+                if dqd_id:
+                    try:
+                        async with asyncio.timeout(10):
+                            data, _ = await fetch_public(DETAIL_URL + dqd_id)
+                            value = await asyncio.to_thread(detail_page, data, dqd_id)
+                        return self.store(article, {**value["content"], "fetched_at": utc_now()})
+                    except RestrictedArticle as exc:
+                        raise ContentError("这篇报道需前往懂球帝阅读。") from exc
+                    except (TimeoutError, OSError, ValueError, httpx.HTTPError):
+                        pass
                 async with asyncio.timeout(20):
                     html, _ = await fetch_public(article["url"])
                 content = await asyncio.to_thread(extract_content, html, article)

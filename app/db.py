@@ -204,6 +204,10 @@ class Database:
                     kind TEXT NOT NULL CHECK(kind IN ('team','player')), tag_id TEXT NOT NULL,
                     name TEXT NOT NULL, PRIMARY KEY(article_id,kind,tag_id));
                 CREATE INDEX IF NOT EXISTS dongqiudi_tag_filter ON dongqiudi_tags(kind,tag_id,article_id);
+                CREATE TABLE IF NOT EXISTS dongqiudi_history (
+                    source_id INTEGER PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+                    source_url TEXT NOT NULL, after_id INTEGER, page INTEGER,
+                    exhausted INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
             """)
             for table in ("sources", "articles"):
                 columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}

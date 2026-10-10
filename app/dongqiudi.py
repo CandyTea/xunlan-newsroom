@@ -2,7 +2,7 @@
 import json
 import re
 from datetime import datetime, timezone
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 from lxml import etree, html
@@ -59,7 +59,7 @@ def public_article_id(url):
     return match[1] if match else None
 
 
-def list_page(data):
+def list_page(data, *, allow_empty=False, require_json=False):
     try:
         payload = json.loads(data)
     except (ValueError, UnicodeError):
@@ -67,7 +67,11 @@ def list_page(data):
     items = []
     after = None
     if isinstance(payload, dict) and isinstance(payload.get("articles"), list):
-        for entry in payload["articles"][:60]:
+        if require_json and (str(payload.get("id")) != "1" or payload.get("code") not in (None, 0, 200)):
+            raise ValueError("懂球帝返回的新闻列表不属于当前公开栏目")
+        if len(payload["articles"]) > 200:
+            raise ValueError("懂球帝新闻列表超过单页大小上限")
+        for entry in payload["articles"]:
             if not isinstance(entry, dict) or entry.get("channel", "article") != "article":
                 continue
             article_id = str(entry.get("id", ""))
@@ -82,9 +86,20 @@ def list_page(data):
                 item["dqd"] = {"author": str(author.get("name") or "")[:200] if isinstance(author, dict) else "",
                                "tags": [], "complete": False}
                 items.append(item)
-        if payload.get("next") and str(payload.get("min", "")).isdigit():
-            after = int(payload["min"])
+        if payload.get("next"):
+            parts = urlsplit(str(payload["next"]))
+            query = parse_qs(parts.query)
+            raw_after = query.get("after", [""])[0]
+            raw_page = query.get("page", [""])[0]
+            if (parts.hostname not in ("api.dongqiudi.com", "www.dongqiudi.com")
+                    or parts.path not in ("/app/tabs/web/1.json", "/api/app/tabs/web/1.json")
+                    or not raw_after.isdigit() or not raw_page.isdigit()
+                    or not 0 < int(raw_after) < 2**63 or not 1 < int(raw_page) <= 1000000):
+                raise ValueError("懂球帝返回的继续读取位置无效")
+            after = {"after": int(raw_after), "page": int(raw_page)}
     else:
+        if require_json:
+            raise ValueError("懂球帝没有返回可继续读取的公开新闻列表")
         root = document(data)
         seen = set()
         for link in root.xpath('//a[contains(@href,"/articles/")]'):
@@ -100,13 +115,13 @@ def list_page(data):
             if item:
                 item["dqd"] = {"author": link.get("author", "")[:200], "tags": [], "complete": False}
                 items.append(item)
-    if not items:
+    if not items and not (allow_empty and isinstance(payload, dict) and isinstance(payload.get("articles"), list)):
         raise ValueError("懂球帝未返回可识别的公开新闻列表")
     return items, after
 
 
-def next_list_url(after):
-    return LIST_URL + "?" + urlencode({"after": after, "page": 2})
+def next_list_url(cursor):
+    return LIST_URL + "?" + urlencode({"after": cursor["after"], "page": cursor["page"]})
 
 
 def tags_from_links(links):

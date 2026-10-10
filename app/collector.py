@@ -502,54 +502,108 @@ class Collector:
             if matches_watch({**article, "category": "sports"}, watch, self.db.catalog):
                 conn.execute("INSERT OR IGNORE INTO article_watches(article_id,watch_id) VALUES(?,?)", (article_id, watch["id"]))
 
-    async def collect_dongqiudi(self, source):
+    def dqd_has_more(self, source):
+        with self.db.connection() as conn:
+            row = conn.execute("SELECT source_url,exhausted FROM dongqiudi_history WHERE source_id=?", (source["id"],)).fetchone()
+        return not row or row["source_url"] != source["url"] or not row["exhausted"]
+
+    def persist_dqd_page(self, source, articles, cursor, advance):
+        # Save articles first. An interrupted cursor write can only repeat a page.
+        with self.db.lock:
+            with self.db.connection() as conn:
+                current = conn.execute("SELECT kind,url,enabled FROM sources WHERE id=?", (source["id"],)).fetchone()
+            if not current or not current["enabled"] or current["kind"] != "dongqiudi" or current["url"] != source["url"]:
+                raise ValueError("懂球帝来源已变更，请重新更新资讯")
+            count = self.persist_articles(source, articles)
+            if advance:
+                with self.db.connection(write=True) as conn:
+                    conn.execute("""INSERT INTO dongqiudi_history(source_id,source_url,after_id,page,exhausted,updated_at)
+                        VALUES(?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET
+                        source_url=excluded.source_url,after_id=excluded.after_id,page=excluded.page,
+                        exhausted=excluded.exhausted,updated_at=excluded.updated_at""",
+                                 (source["id"], source["url"], cursor["after"] if cursor else None,
+                                  cursor["page"] if cursor else None, int(cursor is None), utc_now()))
+            return count
+
+    async def collect_dongqiudi(self, source, *, older=False):
         from .dongqiudi import ARTICLE_URL, DETAIL_URL, HOME_URL, LIST_URL, RestrictedArticle, detail_page, list_page, next_list_url, public_article_id
 
         async with self.dqd_lock:
             now = asyncio.get_running_loop().time()
             key = source["id"]
             self.dqd_refreshed = {k: v for k, v in self.dqd_refreshed.items() if now - v < 60}
-            if key in self.dqd_refreshed:
-                return {"new_count": 0, "partial": False, "recent": True}
             with self.db.connection() as conn:
                 current = conn.execute("SELECT * FROM sources WHERE id=? AND enabled=1 AND kind='dongqiudi'", (source["id"],)).fetchone()
+                progress = conn.execute("SELECT * FROM dongqiudi_history WHERE source_id=?", (source["id"],)).fetchone()
             if current is None:
                 raise ValueError("懂球帝来源已停用，请稍后再试")
             source = dict(current)
+            if progress and progress["source_url"] != source["url"]:
+                progress = None
+            if older and progress and progress["exhausted"]:
+                return {"new_count": 0, "partial": False, "recent": False, "has_more": False}
+            if not older and key in self.dqd_refreshed:
+                return {"new_count": 0, "partial": False, "recent": True, "has_more": self.dqd_has_more(source)}
+            cursor = {"after": progress["after_id"], "page": progress["page"]} if older and progress else None
+            advance = older or progress is None
             items = []
-            completed = []
             failed = 0
-            async with asyncio.timeout(65):
+            count = 0
+            fetched_pages = 0
+            async with asyncio.timeout(70):
                 try:
-                    async with asyncio.timeout(10):
-                        data, _ = await self.fetcher(LIST_URL)
-                        items, after = list_page(data)
+                    async with asyncio.timeout(24):
+                        for _ in range(4 if older else 8):
+                            try:
+                                async with asyncio.timeout(8):
+                                    data, _ = await self.fetcher(next_list_url(cursor) if cursor else LIST_URL)
+                                    batch, following = list_page(data, allow_empty=True, require_json=True)
+                            except (ValueError, OSError, httpx.HTTPError, TimeoutError):
+                                if older or fetched_pages:
+                                    raise
+                                async with asyncio.timeout(8):
+                                    data, _ = await self.fetcher(HOME_URL)
+                                    batch, _ = list_page(data)
+                                count += self.persist_dqd_page(source, batch, None, False)
+                                items.extend(batch)
+                                fetched_pages += 1
+                                failed += 1
+                                break
+                            if cursor and following and (following["after"] >= cursor["after"] or following["page"] <= cursor["page"]):
+                                raise ValueError("懂球帝未返回更早新闻，已保留原来的读取位置")
+                            if not advance and progress and not progress["exhausted"] and (following is None or following["after"] <= progress["after_id"]):
+                                advance = True
+                            count += self.persist_dqd_page(source, batch, following, advance)
+                            items.extend(batch)
+                            fetched_pages += 1
+                            cursor = following
+                            if cursor is None:
+                                break
                 except (ValueError, OSError, httpx.HTTPError, TimeoutError):
-                    async with asyncio.timeout(10):
-                        data, _ = await self.fetcher(HOME_URL)
-                        items, after = list_page(data)
-                if after:
-                    try:
-                        async with asyncio.timeout(8):
-                            data, _ = await self.fetcher(next_list_url(after))
-                            older, _ = list_page(data)
-                        items.extend(older)
-                    except (ValueError, OSError, httpx.HTTPError, TimeoutError):
-                        failed += 1
-                items = list({item["url"]: item for item in items}.values())[:60]
+                    if not fetched_pages:
+                        raise
+                    failed += 1
+                items = list({item["url"]: item for item in items}.values())
                 with self.db.connection() as conn:
                     placeholders = ",".join("?" for _ in items)
                     known = {row["url"] for row in conn.execute("""SELECT a.url FROM articles a
                         JOIN dongqiudi_articles d ON d.article_id=a.id
                         WHERE d.complete=1 AND a.reader_id='public'
-                        AND a.url IN (""" + placeholders + ")", [item["url"] for item in items])}
-                pending = [item for item in items if item["url"] not in known]
+                        AND a.url IN (""" + placeholders + ")", [item["url"] for item in items])} if items else set()
+                    backlog = [dict(row) for row in conn.execute("""SELECT a.url FROM articles a
+                        JOIN dongqiudi_articles d ON d.article_id=a.id WHERE a.source_id=?
+                        AND a.reader_id='public' AND d.complete=0
+                        ORDER BY COALESCE(a.published_at,a.fetched_at) DESC,a.id DESC LIMIT 20""", (source["id"],))]
+                pending_urls = list(dict.fromkeys([item["url"] for item in items if item["url"] not in known] + [row["url"] for row in backlog]))
+                if len(pending_urls) > 60:
+                    failed += 1
+                pending_urls = pending_urls[:60]
                 slots = asyncio.Semaphore(3)
 
-                async def enrich(item):
+                async def enrich(url):
                     nonlocal failed
                     async with slots:
-                        article_id = public_article_id(item["url"])
+                        article_id = public_article_id(url)
                         try:
                             async with asyncio.timeout(14):
                                 try:
@@ -561,23 +615,19 @@ class Collector:
                                 except (ValueError, OSError, httpx.HTTPError, TimeoutError):
                                     data, _ = await self.fetcher(ARTICLE_URL.format(article_id))
                                     full = detail_page(data, article_id)
-                            completed.append(full)
+                            self.persist_articles(source, [full])
                         except (ValueError, OSError, httpx.HTTPError, TimeoutError):
                             failed += 1
-                            completed.append(item)
                 try:
                     async with asyncio.timeout(35):
                         async with asyncio.TaskGroup() as group:
-                            for item in pending:
-                                group.create_task(enrich(item))
+                            for url in pending_urls:
+                                group.create_task(enrich(url))
                 except TimeoutError:
                     failed += 1
-            # Unfinished details remain retryable; their list entries still appear.
-            resolved = {item["url"]: item for item in completed}
-            selected = [resolved.get(item["url"], item) for item in pending]
-            count = self.persist_articles(source, selected)
-            self.dqd_refreshed[key] = asyncio.get_running_loop().time()
-            return {"new_count": count, "partial": bool(failed), "recent": False}
+            if not older:
+                self.dqd_refreshed[key] = asyncio.get_running_loop().time()
+            return {"new_count": count, "partial": bool(failed), "recent": False, "has_more": self.dqd_has_more(source)}
 
     async def collect(self, run_id, categories, *, failed_only=False, skip_source_ids=()):
         new_count = 0

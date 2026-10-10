@@ -125,7 +125,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await reader.stop()
         await guests.stop()
 
-    app = FastAPI(title="Newsroom", version="1.8.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.8.1", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -551,9 +551,10 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             authors = [dict(row) for row in conn.execute("""SELECT d.author AS name,COUNT(*) AS count
                 FROM dongqiudi_articles d JOIN articles a ON a.id=d.article_id
                 WHERE d.author<>'' AND (a.reader_id='public' OR a.reader_id=?) GROUP BY d.author ORDER BY count DESC,name""", (scope,))]
-            enabled = conn.execute("SELECT 1 FROM sources WHERE kind='dongqiudi' AND enabled=1").fetchone() is not None
+            source = conn.execute("SELECT * FROM sources WHERE kind='dongqiudi' AND enabled=1 ORDER BY id LIMIT 1").fetchone()
         return {"teams": [tag for tag in tags if tag["kind"] == "team"],
-                "players": [tag for tag in tags if tag["kind"] == "player"], "authors": authors, "enabled": enabled}
+                "players": [tag for tag in tags if tag["kind"] == "player"], "authors": authors,
+                "enabled": source is not None, "has_more": collector.dqd_has_more(source) if source else False}
 
     @app.post("/api/dongqiudi/refresh")
     async def refresh_dongqiudi(session=Depends(require_reader)):
@@ -565,6 +566,17 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             return await collector.collect_dongqiudi(dict(source))
         except (TimeoutError, OSError, ValueError, httpx.HTTPError) as exc:
             raise HTTPException(503, "暂时无法更新懂球帝资讯，请稍后重试。") from exc
+
+    @app.post("/api/dongqiudi/more")
+    async def more_dongqiudi(session=Depends(require_reader)):
+        with db.connection() as conn:
+            source = conn.execute("SELECT * FROM sources WHERE kind='dongqiudi' AND enabled=1 ORDER BY id LIMIT 1").fetchone()
+        if source is None:
+            raise HTTPException(409, "懂球帝来源当前未启用")
+        try:
+            return await collector.collect_dongqiudi(dict(source), older=True)
+        except (TimeoutError, OSError, ValueError, httpx.HTTPError) as exc:
+            raise HTTPException(503, "暂时无法加载更早的懂球帝资讯，已保留读取位置，可以重试。") from exc
 
     @app.get("/api/articles")
     def articles(category: str = "", q: str = Query("", max_length=200), following: bool = False,
