@@ -22,8 +22,9 @@ from .browser import browser_cache_url, browser_source_allowed, browser_source_u
 from .content import ArticleReader, ContentError
 from .db import Database, default_media_name, ensure_media, utc_now
 from .guests import GuestReaders
+from .history import HistoryError, TelegramHistory
 from .dns import dns_mode
-from .models import ArticleHtml, ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, MediaFollow, ReadingPreferences, Schedule, Settings, Setup, Source, TranslationRequest, TranslationSettings, Watch
+from .models import ArticleHtml, ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, HistoryCursor, HistoryImport, MediaFollow, ReadingPreferences, Schedule, Settings, Setup, Source, TranslationRequest, TranslationSettings, Watch
 from .scheduler import Scheduler, next_run, schedule_from_row
 from .translation import PROVIDERS, TranslationError, Translator, needs_translation
 
@@ -67,6 +68,8 @@ class BodyLimitMiddleware:
         limit = 4 * 1024 * 1024 if scope["path"] == "/api/browser/import" and scope["method"] == "POST" else 64 * 1024
         if scope["path"].startswith("/api/articles/") and scope["path"].endswith("/content/import") and scope["method"] == "POST":
             limit = 4 * 1024 * 1024
+        if scope["path"].startswith("/api/media/") and scope["path"].endswith("/history/import") and scope["method"] == "POST":
+            limit = 4 * 1024 * 1024
         if scope["path"] == "/api/translation/settings" and scope["method"] == "PUT":
             limit = 256 * 1024
         while True:
@@ -96,6 +99,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
     db = Database(Path(data_dir or os.getenv("NEWSROOM_DATA_DIR", ROOT / "data")) / "newsroom.sqlite3")
     db.initialize()
     collector = Collector(db, fetcher)
+    history = TelegramHistory(db, collector)
     translator = Translator(db)
     reader = ArticleReader(db)
     guests = GuestReaders(db)
@@ -119,7 +123,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await reader.stop()
         await guests.stop()
 
-    app = FastAPI(title="Newsroom", version="1.6.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.7.0", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -135,6 +139,10 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         if request.url.path.startswith("/api/") or request.url.path in ("/", "/admin"):
             response.headers["Cache-Control"] = "no-store"
         return response
+
+    @app.exception_handler(HistoryError)
+    async def history_error(request, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=exc.status)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_input(request, exc):
@@ -316,13 +324,14 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             values.append(media_id)
         rows = conn.execute("""SELECT * FROM (
             SELECT m.id,m.name,
+                EXISTS(SELECT 1 FROM sources s WHERE s.media_id=m.id AND s.enabled=1 AND s.kind='telegram') AS history_supported,
                 (SELECT COUNT(*) FROM sources s WHERE s.media_id=m.id AND s.enabled=1) AS source_count,
                 (SELECT COUNT(*) FROM articles a WHERE a.media_id=m.id AND (a.reader_id='public' OR a.reader_id=?)) AS article_count,
                 EXISTS(SELECT 1 FROM media_follows f WHERE f.media_id=m.id AND f.reader_id=?) AS followed
             FROM media m""" + where + """
             ) WHERE source_count>0 OR article_count>0 OR followed=1
             ORDER BY followed DESC,name COLLATE NOCASE,id""", values).fetchall()
-        return [{**dict(row), "followed": bool(row["followed"])} for row in rows]
+        return [{**dict(row), "followed": bool(row["followed"]), "history_supported": bool(row["history_supported"])} for row in rows]
 
     def visible_media(conn, media_id, session):
         items = media_for_reader(conn, session, media_id)
@@ -506,11 +515,30 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             value["followed"] = body.followed
             return value
 
+    @app.get("/api/media/{media_id}/history")
+    def media_history(media_id: int, session=Depends(require_reader)):
+        with db.connection() as conn:
+            visible_media(conn, media_id, session)
+        return {"items": history.sources(media_id, reader_id(session))}
+
+    @app.post("/api/media/{media_id}/history")
+    async def fetch_history(media_id: int, body: HistoryCursor, session=Depends(require_reader)):
+        with db.connection() as conn:
+            visible_media(conn, media_id, session)
+        return await history.fetch(media_id, reader_id(session), body)
+
+    @app.post("/api/media/{media_id}/history/import")
+    def import_history(media_id: int, body: HistoryImport, session=Depends(require_reader)):
+        with db.connection() as conn:
+            visible_media(conn, media_id, session)
+        return history.save(media_id, reader_id(session), body, body.content)
+
     @app.get("/api/articles")
     def articles(category: str = "", q: str = Query("", max_length=200), following: bool = False,
                  saved: bool = False, unread: bool = False, watch_id: int | None = Query(None, gt=0),
                  company_id: int | None = Query(None, gt=0), league_id: str = Query("", max_length=80),
                  team_id: str = Query("", max_length=80), media_id: int | None = Query(None, gt=0),
+                 cursor_id: int | None = Query(None, gt=0),
                  page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), session=Depends(require_reader)):
         conditions = ["(a.reader_id='public' OR a.reader_id=?)"]
         params = [reader_id(session)]
@@ -571,10 +599,18 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         translation_config = reading_services(session)[1].snapshot()
         with db.connection() as conn:
             total = conn.execute("SELECT COUNT(*) FROM articles a" + joins + where, [*join_params, *params]).fetchone()[0]
+            if cursor_id is not None:
+                cursor = visible_article(conn, cursor_id, session)
+                cursor_date = cursor["published_at"] or cursor["fetched_at"]
+                where += " AND (COALESCE(a.published_at,a.fetched_at)<? OR (COALESCE(a.published_at,a.fetched_at)=? AND a.id<?))"
+                params.extend([cursor_date, cursor_date, cursor_id])
             rows = conn.execute("SELECT a.* FROM articles a" + joins + where + " ORDER BY COALESCE(a.published_at,a.fetched_at) DESC,a.id DESC LIMIT ? OFFSET ?",
-                                [*join_params, *params, page_size, (page - 1) * page_size]).fetchall()
+                                [*join_params, *params, page_size + 1, 0 if cursor_id is not None else (page - 1) * page_size]).fetchall()
+            has_more = len(rows) > page_size
+            rows = rows[:page_size]
             items = [article_from_row(conn, row, session, translation_config) for row in rows]
-        return {"items": items, "total": total, "page": page, "page_size": page_size}
+        return {"items": items, "total": total, "page": page, "page_size": page_size,
+                "has_more": has_more, "next_cursor": rows[-1]["id"] if rows else None}
 
     @app.get("/api/articles/{article_id}")
     def article(article_id: int, session=Depends(require_reader)):

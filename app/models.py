@@ -160,6 +160,16 @@ class BrowserFeed(StrictModel):
     content: str = Field(max_length=2 * 1024 * 1024)
 
 
+class HistoryCursor(StrictModel):
+    source_id: int = Field(gt=0)
+    before: int | None = Field(default=None, gt=0, le=9_223_372_036_854_775_807)
+
+
+class HistoryImport(HistoryCursor):
+    source_url: str = Field(min_length=1, max_length=2048)
+    content: str = Field(min_length=1, max_length=2 * 1024 * 1024)
+
+
 class BrowserFailure(StrictModel):
     source_id: int = Field(gt=0)
     source_url: str = Field(min_length=1, max_length=2048)

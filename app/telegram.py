@@ -2,7 +2,7 @@
 import html as text_html
 import re
 import textwrap
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from lxml import etree, html
 
@@ -28,7 +28,7 @@ def channel_url(value):
     return "https://t.me/s/" + value.lower()
 
 
-def parse_telegram(data, source_url):
+def parse_telegram_page(data, source_url):
     from .collector import MAX_BYTES, _article
 
     if isinstance(data, str):
@@ -43,11 +43,13 @@ def parse_telegram(data, source_url):
     messages = root.xpath("//*[contains(concat(' ',normalize-space(@class),' '),' tgme_widget_message ')]")
     articles = []
     seen = set()
+    message_ids = []
     for message in messages[:100]:
         post = message.get("data-post", "")
         match = re.fullmatch(r"([A-Za-z][A-Za-z0-9_]{2,31})/([1-9][0-9]{0,19})", post)
         if not match or match[1].lower() != channel or match[2] in seen:
             continue
+        message_ids.append(int(match[2]))
         texts = message.xpath(".//*[contains(concat(' ',normalize-space(@class),' '),' tgme_widget_message_text ')]")
         if not texts:
             continue
@@ -72,6 +74,28 @@ def parse_telegram(data, source_url):
             article["content"] = {"paragraphs": paragraphs, "author": "@" + channel}
             articles.append(article)
             seen.add(match[2])
+    older = []
+    for link in root.xpath("//a[@data-before or contains(@href,'before=')]"):
+        candidate = link.get("data-before", "")
+        if not candidate:
+            try:
+                parts = urlsplit(link.get("href", ""))
+            except ValueError:
+                continue
+            if parts.hostname not in (None, "t.me") or parts.path.rstrip("/").lower() != "/s/" + channel:
+                continue
+            candidate = parse_qs(parts.query).get("before", [""])[0]
+        if re.fullmatch(r"[1-9][0-9]{0,19}", candidate):
+            older.append(int(candidate))
+    usernames = root.xpath("//*[contains(concat(' ',normalize-space(@class),' '),' tgme_channel_info_header_username ')]")
+    recognized = bool(message_ids) or any(node.text_content().strip().lower() == "@" + channel for node in usernames)
+    if not recognized:
+        raise ValueError("Telegram 未返回该频道的有效公开预览")
+    return {"articles": articles, "message_ids": message_ids, "older": older}
+
+
+def parse_telegram(data, source_url):
+    articles = parse_telegram_page(data, source_url)["articles"]
     if not articles:
         raise ValueError("频道没有可读取的公开文字消息，请检查用户名、频道公开状态或网页预览权限")
     return articles

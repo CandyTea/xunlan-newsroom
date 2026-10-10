@@ -26,12 +26,14 @@ const ICONS = {
   warning: '<path d="m12 3 10 18H2zM12 9v5M12 17v.1"/>',
   chevron: '<path d="m9 5 7 7-7 7"/>',
 };
-const state = { session: null, view: "news", followingMode: "objects", mediaId: "", media: [], category: "", q: "", saved: false, unread: false, watchId: "", companyId: "", leagueId: "", teamId: "", sportsWatchId: "", page: 1, articles: [], total: 0, pageSize: 20, watches: [], catalog: { companies: [], leagues: [], teams: [] }, schedules: [], settings: { timezone: "Asia/Shanghai" }, status: {}, manageWatches: false, renderId: 0, modalId: 0, toastTimer: null, fetching: false, pollBusy: false };
+const state = { session: null, view: "news", viewMode: "pages", followingMode: "objects", mediaId: "", media: [], category: "", q: "", saved: false, unread: false, watchId: "", companyId: "", leagueId: "", teamId: "", sportsWatchId: "", page: 1, articles: [], total: 0, pageSize: 20, watches: [], catalog: { companies: [], leagues: [], teams: [] }, schedules: [], settings: { timezone: "Asia/Shanghai" }, status: {}, manageWatches: false, renderId: 0, modalId: 0, toastTimer: null, fetching: false, pollBusy: false };
 const $ = (selector, root = document) => root.querySelector(selector);
 const main = $("#main-content");
 const modal = $("#modal");
 const deviceNews = { busy: false, lastAttempt: 0, controller: null, pending: null };
 const listTranslation = { controller: null, retryAfter: 0 };
+const streamNews = { observer: null, controller: null, busy: false, cursor: null, hasMore: false, error: "" };
+const historyNews = { controller: null, busy: false };
 let articleContentController = null;
 
 function canRead() { return Boolean(state.session?.authenticated || state.session?.guest); }
@@ -191,13 +193,15 @@ async function refreshData() {
   renderSidebar(); updateFetchButtons();
 }
 async function enterApp() {
-  deviceNews.controller?.abort(); listTranslation.controller?.abort(); closeModal();
+  deviceNews.controller?.abort(); listTranslation.controller?.abort(); historyNews.controller?.abort(); stopStream(); closeModal();
   state.renderId += 1; state.articles = []; state.watches = []; state.media = []; state.mediaId = ""; state.schedules = []; state.status = {};
   state.settings = { timezone: "Asia/Shanghai" }; state.total = 0; state.fetching = false;
   deviceNews.lastAttempt = 0; listTranslation.retryAfter = 0;
   main.replaceChildren(loading());
   $("#boot").hidden = true; $("#auth").hidden = true; $("#app").hidden = false;
   await refreshData(); if (!canRead()) return;
+  state.viewMode = "pages";
+  try { if (localStorage.getItem(readingModeKey()) === "stream") state.viewMode = "stream"; } catch {}
   restoreFocus();
   route();
   collectDeviceNews();
@@ -232,7 +236,7 @@ async function collectDeviceFeeds(categories, session, controller) {
     }
     await refreshData();
     if (result.newCount && !document.hidden && !state.manageWatches && !modal.open) {
-      if (isReaderView()) await renderReader(++state.renderId, true);
+      if (isReaderView()) await refreshReaderNews();
       else if (state.view === "following" && state.followingMode === "media") await renderMediaList(++state.renderId);
     }
     return result.sourceIds;
@@ -242,6 +246,7 @@ async function collectDeviceFeeds(categories, session, controller) {
   }
 }
 function route() {
+  historyNews.controller?.abort();
   const next = location.hash.slice(1); const mediaRoute = /^media\/([1-9]\d*)$/.exec(next);
   state.mediaId = mediaRoute ? mediaRoute[1] : "";
   state.followingMode = next === "following/media" || mediaRoute ? "media" : "objects";
@@ -255,7 +260,7 @@ function route() {
 }
 async function renderView() {
   if (!canRead()) return;
-  listTranslation.controller?.abort();
+  listTranslation.controller?.abort(); historyNews.controller?.abort(); stopStream();
   const id = ++state.renderId;
   if (state.view === "news" || state.view === "following") {
     if (state.view === "following" && state.followingMode === "media" && !state.mediaId) return renderMediaList(id);
@@ -270,6 +275,25 @@ function setFilter(key, value) {
   state[key] = value; state.page = 1; if (state.view === "news") persistFocus(); renderView();
 }
 function focusStorageKey() { return `xunlan.focus.${encodeURIComponent(state.session?.reader_key || state.session?.username || "")}`; }
+function readingModeKey() { return `xunlan.reading-mode.${encodeURIComponent(state.session?.reader_key || state.session?.username || "")}`; }
+function setReadingMode(mode) {
+  if (mode === state.viewMode) return;
+  state.viewMode = mode; state.page = 1;
+  try { localStorage.setItem(readingModeKey(), mode); } catch {}
+  renderView();
+}
+function stopStream() {
+  streamNews.observer?.disconnect(); streamNews.controller?.abort();
+  Object.assign(streamNews, { observer: null, controller: null, busy: false, cursor: null, hasMore: false, error: "" });
+}
+async function refreshReaderNews() {
+  if (historyNews.busy) return;
+  if (state.viewMode === "stream" && $("#reader-list .news-list")) {
+    const notice = $("#reader-update"); if (notice) notice.hidden = false;
+    return;
+  }
+  return renderReader(++state.renderId, true);
+}
 function normalizeFocus() {
   if (!state.watches.some(w => w.type === "company" && w.enabled && String(w.id) === state.companyId)) state.companyId = "";
   if (!state.catalog.leagues.some(l => l.id === state.leagueId)) state.leagueId = "";
@@ -402,6 +426,149 @@ function readerEmpty() {
   if (state.view === "following") return empty(state.watches.length ? "等待你的关注资讯" : "从一个关注对象开始", state.watches.length ? "目前还没有资讯命中关注对象。收取新资讯，或编辑别名与上下文关键词来调整匹配。" : "添加公司、工作室、球队、国家或政客。讯览会从真实资讯中找出相关报道。", [button(state.watches.length ? "管理关注" : "添加关注", () => state.watches.length ? showWatchManager() : watchForm(), "button button-primary", "plus"), state.watches.length && button("收取资讯", () => requestFetch(), "button", "refresh")].filter(Boolean), "bookmark");
   return empty("阅读室已准备好", "收取第一批报道，或先添加感兴趣的公司、联赛与球队，再设置每天的收取时间。", [button("收取资讯", () => requestFetch(), "button button-primary", "refresh"), button("添加关注", () => watchForm(), "button", "plus")]);
 }
+function readerParams(cursor = null) {
+  const following = state.view === "following" && !state.mediaId;
+  const params = new URLSearchParams({ page: String(state.viewMode === "stream" ? 1 : state.page), page_size: String(state.pageSize), following: String(following), saved: String(state.saved), unread: String(state.unread) });
+  if (state.category) params.set("category", state.category);
+  if (state.q) params.set("q", state.q);
+  if (state.watchId) params.set("watch_id", state.watchId);
+  if (state.mediaId) params.set("media_id", state.mediaId);
+  if (!following && !state.mediaId) {
+    if (state.category === "sports") {
+      if (state.sportsWatchId) params.set("watch_id", state.sportsWatchId);
+      else { if (state.leagueId) params.set("league_id", state.leagueId); if (state.teamId) params.set("team_id", state.teamId); }
+    } else if (state.companyId) params.set("company_id", state.companyId);
+  }
+  if (cursor) params.set("cursor_id", String(cursor));
+  return params;
+}
+function historyButton() {
+  const media = state.media.find(item => String(item.id) === state.mediaId);
+  if (!media?.history_supported) return null;
+  return button(historyNews.busy ? "正在加载更早消息…" : "加载更早消息", loadOlderMessages, "button button-small", "clock", { disabled: historyNews.busy, "data-history-button": true });
+}
+function updateHistoryButtons() {
+  document.querySelectorAll("[data-history-button]").forEach(node => {
+    node.disabled = historyNews.busy;
+    node.replaceChildren(icon("clock"), historyNews.busy ? "正在加载更早消息…" : "加载更早消息");
+  });
+}
+function renderStreamFooter(id, observe = true) {
+  streamNews.observer?.disconnect();
+  const list = $("#reader-list"); if (!list || id !== state.renderId) return;
+  $("#reader-more", list)?.remove();
+  const more = streamNews.hasMore ? button(streamNews.busy ? "正在加载…" : streamNews.error ? "重试加载" : "加载更多", () => loadMoreStream(id), "button button-small", null, { disabled: streamNews.busy }) : null;
+  const footer = el("div", { id: "reader-more", class: "reader-more", "aria-live": "polite" }, [
+    el("p", { text: streamNews.error || (streamNews.hasMore ? `已显示 ${state.articles.length} 条消息` : "已读完当前已收取的消息") }),
+    el("div", { class: "reader-more-actions" }, [more, !streamNews.hasMore && historyButton()]),
+  ]);
+  list.append(footer);
+  if (observe && streamNews.hasMore && !streamNews.busy && "IntersectionObserver" in window) {
+    streamNews.observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting) && !document.hidden && !modal.open) loadMoreStream(id);
+    }, { rootMargin: "400px 0px" });
+    streamNews.observer.observe(footer);
+  }
+}
+async function loadMoreStream(id) {
+  if (id !== state.renderId || state.viewMode !== "stream" || streamNews.busy || !streamNews.hasMore || document.hidden || modal.open) return;
+  const list = $("#reader-list .news-list"); if (!list) return;
+  const controller = new AbortController();
+  const cursor = streamNews.cursor;
+  streamNews.controller = controller; streamNews.busy = true; streamNews.error = "";
+  renderStreamFooter(id, false);
+  try {
+    const data = await api(`/articles?${readerParams(cursor)}`, { signal: controller.signal });
+    if (controller.signal.aborted || id !== state.renderId) return;
+    if (data.has_more && data.next_cursor === cursor) throw new Error("暂时无法继续加载，请重试。");
+    const seen = new Set(state.articles.map(article => article.id));
+    const added = (data.items || []).filter(article => !seen.has(article.id));
+    state.articles.push(...added); state.total = data.total;
+    streamNews.cursor = data.next_cursor || cursor; streamNews.hasMore = Boolean(data.has_more);
+    list.append(...added.map(articleRow));
+    const count = $("#reader-count"); if (count) count.textContent = `共 ${state.total} 条资讯`;
+    autoTranslateList(id);
+  } catch (error) {
+    if (!controller.signal.aborted && id === state.renderId) streamNews.error = "加载失败，已显示的消息会保留。请点击重试。";
+  } finally {
+    if (streamNews.controller === controller) {
+      streamNews.controller = null; streamNews.busy = false;
+      if (id === state.renderId) renderStreamFooter(id, !streamNews.error);
+    }
+  }
+}
+function resumeStream() {
+  if (state.viewMode !== "stream" || !isReaderView() || streamNews.error || document.hidden || modal.open) return;
+  const footer = $("#reader-more");
+  if (footer && footer.getBoundingClientRect().top < window.innerHeight + 400) loadMoreStream(state.renderId);
+}
+async function fetchHistorySource(mediaId, source, signal) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) controller.abort();
+  const body = { source_id: source.id, before: source.before };
+  try {
+    return await Promise.any([
+      api(`/media/${mediaId}/history`, { method: "POST", body, signal: controller.signal }),
+      (async () => {
+        const content = await BrowserNews.historyPage(source, controller.signal);
+        if (controller.signal.aborted) throw new Error("加载已取消");
+        return api(`/media/${mediaId}/history/import`, { method: "POST", body: { ...body, source_url: source.url, content }, signal: controller.signal });
+      })(),
+    ]);
+  } catch (error) {
+    const failures = error.errors || [error];
+    const auth = failures.find(failure => [401, 403].includes(failure.status) || failure.code === "reader_changed");
+    if (auth) throw auth;
+    if (failures.some(failure => failure.status === 409)) return { new_count: 0, changed: true };
+    throw new Error("暂时无法加载更早消息，请稍后重试。");
+  } finally { controller.abort(); signal.removeEventListener("abort", abort); }
+}
+async function loadOlderMessages() {
+  if (historyNews.busy || !state.mediaId) return;
+  const mediaId = state.mediaId, id = state.renderId, session = state.session;
+  const controller = new AbortController();
+  historyNews.controller = controller; historyNews.busy = true; updateHistoryButtons();
+  const active = () => !controller.signal.aborted && id === state.renderId && session === state.session && mediaId === state.mediaId;
+  const previousTotal = state.total;
+  const lastPage = state.page >= Math.ceil(previousTotal / state.pageSize);
+  let newCount = 0, completed = 0, failed = 0, remaining = 0;
+  try {
+    const data = await api(`/media/${mediaId}/history`, { signal: controller.signal });
+    if (!active()) return;
+    const sources = data.items.filter(source => !source.exhausted);
+    if (!sources.length) { toast("已到频道当前可读取历史的起点。"); return; }
+    for (const source of sources) {
+      if (!active()) return;
+      try {
+        const result = await fetchHistorySource(mediaId, source, controller.signal);
+        if (!active()) return;
+        newCount += result.new_count || 0; completed += 1;
+        if (!result.exhausted) remaining += 1;
+      } catch (error) {
+        if (!active()) return;
+        if ([401, 403].includes(error.status) || error.code === "reader_changed") throw error;
+        failed += 1;
+      }
+    }
+    if (!active()) return;
+    if (!completed) throw new Error("暂时无法加载更早消息，请稍后重试。");
+    await refreshData(); if (!active()) return;
+    historyNews.controller = null; historyNews.busy = false; updateHistoryButtons();
+    const atStart = !remaining && !failed;
+    toast(newCount ? `已加载 ${newCount} 条更早消息${failed ? "，部分频道可稍后重试" : atStart ? "，已到可读取历史的起点" : ""}` : atStart ? "已到频道当前可读取历史的起点。" : "历史进度已更新，当前这批没有新增文字消息。可以继续向前加载。");
+    if (state.viewMode === "stream" && $("#reader-list .news-list")) {
+      const notice = $("#reader-update"); if (notice && newCount) notice.hidden = false;
+      streamNews.hasMore = true; await loadMoreStream(id);
+    } else {
+      if (newCount && lastPage && previousTotal && !state.q && !state.saved && !state.unread && !state.category) state.page = Math.floor(previousTotal / state.pageSize) + 1;
+      await renderView();
+    }
+  } catch (error) { if (active()) showError(error); }
+  finally {
+    if (historyNews.controller === controller) { historyNews.controller = null; historyNews.busy = false; updateHistoryButtons(); }
+  }
+}
 async function renderReader(id, quiet = false) {
   listTranslation.controller?.abort();
   const publisher = Boolean(state.mediaId);
@@ -415,12 +582,13 @@ async function renderReader(id, quiet = false) {
   }
   const following = state.view === "following" && !publisher;
   const subtitle = following ? "从已收取的资讯中，找到你关心的人和事。" : "按栏目阅读，按兴趣关注。";
-  const head = publisher ? heading(media.name, "这个媒体已收取的全部消息，按发布时间排序。", [button("返回媒体", () => { location.hash = "following/media"; }, "button"), mediaFollowButton(media)]) : heading(following ? "我的关注" : "今日资讯", subtitle, following ? [button("管理关注", showWatchManager, "button", "edit")] : [button("关注媒体", () => { location.hash = "following/media"; }, "button")]);
+  const head = publisher ? heading(media.name, "这个媒体已收取的全部消息，按发布时间排序。", [button("返回媒体", () => { location.hash = "following/media"; }, "button"), historyButton(), mediaFollowButton(media)]) : heading(following ? "我的关注" : "今日资讯", subtitle, following ? [button("管理关注", showWatchManager, "button", "edit")] : [button("关注媒体", () => { location.hash = "following/media"; }, "button")]);
   if (publisher) document.title = `${media.name} · 讯览`;
   const categories = el("nav", { class: "category-tabs", "aria-label": "资讯栏目" }, Object.entries({ "": "全部", ...CATEGORIES }).map(([key, name]) => button(name, () => setFilter("category", key), "", null, { "aria-pressed": String(state.category === key) })));
   const search = el("form", { class: "search-form", role: "search", onsubmit: event => { event.preventDefault(); setFilter("q", $("input", search).value.trim()); } }, [input("q", state.q, { type: "search", placeholder: "搜索标题与摘要", "aria-label": "搜索资讯", maxlength: 200 }), el("button", { class: "icon-button", type: "submit", "aria-label": "搜索" }, icon("search"))]);
   const filters = el("div", { class: "reader-filters" }, [button("未读", () => setFilter("unread", !state.unread), "filter-button", "eye", { "aria-pressed": String(state.unread) }), button("已收藏", () => setFilter("saved", !state.saved), "filter-button", "bookmark", { "aria-pressed": String(state.saved) })]);
-  const tools = el("div", { class: "reader-tools" }, [search, filters]);
+  const mode = el("div", { class: "reader-mode", role: "group", "aria-label": "阅读方式" }, [button("分页", () => setReadingMode("pages"), "", null, { "aria-pressed": String(state.viewMode === "pages") }), button("瀑布流", () => setReadingMode("stream"), "", null, { "aria-pressed": String(state.viewMode === "stream") })]);
+  const tools = el("div", { class: "reader-tools" }, [search, filters, mode]);
   if (following && state.watches.length) {
     const watchSelect = select("watch_id", { "": "全部关注对象", ...Object.fromEntries(state.watches.map(w => [w.id, w.name])) }, state.watchId, { class: "watch-selector", "aria-label": "筛选关注对象", onchange: event => setFilter("watchId", event.target.value) });
     tools.append(watchSelect);
@@ -437,22 +605,22 @@ async function renderReader(id, quiet = false) {
     list,
   ].filter(Boolean));
   try {
-    const params = new URLSearchParams({ page: String(state.page), page_size: String(state.pageSize), following: String(following), saved: String(state.saved), unread: String(state.unread) });
-    if (state.category) params.set("category", state.category); if (state.q) params.set("q", state.q); if (state.watchId) params.set("watch_id", state.watchId);
-    if (publisher) params.set("media_id", state.mediaId);
-    if (!following && !publisher) {
-      if (state.category === "sports") {
-        if (state.sportsWatchId) params.set("watch_id", state.sportsWatchId);
-        else { if (state.leagueId) params.set("league_id", state.leagueId); if (state.teamId) params.set("team_id", state.teamId); }
-      } else if (state.companyId) params.set("company_id", state.companyId);
-    }
-    const data = await api(`/articles?${params}`); if (id !== state.renderId || (quiet && (modal.open || document.hidden))) return;
+    const data = await api(`/articles?${readerParams()}`); if (id !== state.renderId || (quiet && (modal.open || document.hidden))) return;
     const scrollY = window.scrollY;
     state.articles = data.items || []; state.total = data.total || 0;
-    if (!state.articles.length) { list.replaceChildren(readerEmpty()); return; }
-    list.replaceChildren(el("div", { class: "list-meta" }, [el("span", { text: `共 ${state.total} 条${following ? "关注" : ""}资讯` }), el("span", { text: "按发布时间排序" })]), el("div", { class: "news-list" }, state.articles.map(articleRow)));
+    streamNews.cursor = data.next_cursor; streamNews.hasMore = Boolean(data.has_more);
+    if (!state.articles.length) {
+      list.replaceChildren(readerEmpty());
+      const historyControl = historyButton(); if (historyControl) list.append(el("div", { class: "reader-more-actions" }, historyControl));
+      return;
+    }
+    list.replaceChildren(el("div", { class: "list-meta" }, [el("span", { id: "reader-count", text: `共 ${state.total} 条${following ? "关注" : ""}资讯` }), el("span", { text: "按发布时间排序" }), button("有更新，点击刷新", () => { renderView(); window.scrollTo({ top: 0, behavior: "instant" }); }, "reader-update", null, { id: "reader-update", hidden: true })]), el("div", { class: "news-list" }, state.articles.map(articleRow)));
     const pages = Math.ceil(state.total / state.pageSize);
-    if (pages > 1) list.append(el("nav", { class: "pagination", "aria-label": "资讯分页" }, [button("上一页", () => changePage(-1), "button button-small", null, { disabled: state.page <= 1 }), el("span", { text: `${state.page} / ${pages}` }), button("下一页", () => changePage(1), "button button-small", null, { disabled: state.page >= pages })]));
+    if (state.viewMode === "stream") renderStreamFooter(id);
+    else {
+      if (pages > 1) list.append(el("nav", { class: "pagination", "aria-label": "资讯分页" }, [button("上一页", () => changePage(-1), "button button-small", null, { disabled: state.page <= 1 }), el("span", { text: `${state.page} / ${pages}` }), button("下一页", () => changePage(1), "button button-small", null, { disabled: state.page >= pages })]));
+      const historyControl = historyButton(); if (historyControl) list.append(el("div", { class: "reader-more-actions" }, historyControl));
+    }
     if (quiet) window.scrollTo({ top: scrollY, behavior: "instant" });
     autoTranslateList(id);
   } catch (error) { if (!quiet && id === state.renderId && error.status !== 401) list.replaceChildren(errorPanel(error, renderView)); }
@@ -481,6 +649,7 @@ async function autoTranslateList(id) {
   if (!canRead() || $("#app").hidden || !isReaderView() || state.manageWatches) return;
   if (!preferences?.ready || !preferences.auto_translate_list || document.hidden || Date.now() < listTranslation.retryAfter) return;
   const pending = state.articles.filter(article => article.needs_translation && !article.translation);
+  const queued = new Set(pending.map(article => article.id));
   if (!pending.length) return;
   const controller = new AbortController();
   listTranslation.controller = controller;
@@ -509,7 +678,10 @@ async function autoTranslateList(id) {
     }
   }
   try { await Promise.all([worker(), worker()]); }
-  finally { if (listTranslation.controller === controller) listTranslation.controller = null; }
+  finally {
+    if (listTranslation.controller === controller) listTranslation.controller = null;
+    if (active() && !stopped && !document.hidden && state.articles.some(article => !queued.has(article.id) && article.needs_translation && !article.translation)) autoTranslateList(id);
+  }
 }
 async function articleDetail(id) {
   const modalId = openModal("资讯", loading("正在打开资讯…"), "article-modal");
@@ -867,7 +1039,7 @@ async function pollStatus() {
     if (wasFetching && !state.status.fetching) {
       await refreshData();
       if (!state.manageWatches && !modal.open) {
-        if (isReaderView()) renderReader(++state.renderId, true);
+        if (isReaderView()) refreshReaderNews();
         else if (state.view === "following" && state.followingMode === "media") renderMediaList(++state.renderId);
       }
     }
@@ -877,11 +1049,11 @@ async function pollStatus() {
 
 document.querySelectorAll("[data-icon]").forEach(node => node.replaceChildren(icon(node.dataset.icon)));
 $("#modal-close").addEventListener("click", closeModal);
-modal.addEventListener("close", () => { if (!modal.open) { articleContentController?.abort(); articleContentController = null; } });
+modal.addEventListener("close", () => { if (!modal.open) { articleContentController?.abort(); articleContentController = null; resumeStream(); } });
 modal.addEventListener("click", event => { if (event.target === modal) { const rect = modal.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) closeModal(); } });
 $("#header-fetch").addEventListener("click", requestFetch);
 window.addEventListener("hashchange", () => { if (canRead() && !$("#app").hidden) route(); });
-document.addEventListener("visibilitychange", () => { if (!document.hidden) { pollStatus(); autoTranslateList(state.renderId); } });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { pollStatus(); autoTranslateList(state.renderId); resumeStream(); } });
 async function enterGuest() {
   const submit = $("#auth-guest"); submit.disabled = true;
   try { state.session = await api("/guest", { method: "POST", body: {} }); await enterApp(); }

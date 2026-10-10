@@ -189,12 +189,17 @@ class Database:
                 CREATE TABLE IF NOT EXISTS media_follows (
                     reader_id TEXT NOT NULL, media_id INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
                     PRIMARY KEY(reader_id,media_id));
+                CREATE TABLE IF NOT EXISTS telegram_history (
+                    reader_id TEXT NOT NULL, source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                    source_url TEXT NOT NULL, before_id INTEGER, exhausted INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL, PRIMARY KEY(reader_id,source_id));
             """)
             for table in ("sources", "articles"):
                 columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
                 if "media_id" not in columns:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN media_id INTEGER REFERENCES media(id)")
             conn.execute("CREATE INDEX IF NOT EXISTS articles_media ON articles(media_id,id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS articles_source_reader ON articles(source_id,reader_id,id)")
             conn.execute("CREATE INDEX IF NOT EXISTS sources_media ON sources(media_id,enabled)")
             for source in conn.execute("SELECT * FROM sources WHERE media_id IS NULL").fetchall():
                 media_id = ensure_media(conn, default_media_name(source))

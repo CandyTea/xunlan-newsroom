@@ -61,9 +61,10 @@ window.BrowserNews = (() => {
         const channel = new URL(route.sourceUrl).pathname.split("/").filter(Boolean).at(-1).toLowerCase();
         const valid = Array.from(preview.content.querySelectorAll(".tgme_widget_message[data-post]")).some(message => {
           const post = message.getAttribute("data-post").split("/");
-          return post.length === 2 && post[0].toLowerCase() === channel && /^[1-9][0-9]*$/.test(post[1]) && message.querySelector(".tgme_widget_message_text")?.textContent.trim();
+          return post.length === 2 && post[0].toLowerCase() === channel && /^[1-9][0-9]*$/.test(post[1]) && (route.history || message.querySelector(".tgme_widget_message_text")?.textContent.trim());
         });
-        if (!valid) throw new Error("频道未返回可读取的公开文字消息");
+        const channelHeader = Array.from(preview.content.querySelectorAll(".tgme_channel_info_header_username")).some(node => node.textContent.trim().toLowerCase() === `@${channel}`);
+        if (!valid && !(route.history && channelHeader)) throw new Error("频道未返回可读取的公开文字消息");
         return { content, format: "telegram" };
       }
       if (format === "rss2json") {
@@ -144,6 +145,14 @@ window.BrowserNews = (() => {
     return result;
   }
 
+  async function historyPage(source, signal) {
+    for (const route of routes({ kind: "telegram", url: source.fetch_url })) {
+      try { return (await readFeed({ ...route, history: true }, signal)).content; }
+      catch (error) { if (signal.aborted) throw error; }
+    }
+    throw new Error("暂时无法加载更早消息，请稍后重试");
+  }
+
   async function articlePage(url, signal, reader = false) {
     const route = reader ? {
       url: `https://r.jina.ai/${url}`, format: "article", timeout: 25000,
@@ -158,5 +167,5 @@ window.BrowserNews = (() => {
     return html;
   }
 
-  return { collect, articlePage };
+  return { collect, articlePage, historyPage };
 })();
