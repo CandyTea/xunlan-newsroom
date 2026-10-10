@@ -431,7 +431,7 @@ class Collector:
     def persist_articles(self, source, articles, reader_id="public"):
         count = 0
         with self.db.connection(write=True) as conn:
-            current = conn.execute("SELECT enabled FROM sources WHERE id=?", (source["id"],)).fetchone()
+            current = conn.execute("SELECT enabled,media_id FROM sources WHERE id=?", (source["id"],)).fetchone()
             if current is None or not current["enabled"]:
                 return 0
             watches = [watch_from_row(row) for row in conn.execute(
@@ -444,9 +444,9 @@ class Collector:
                         continue
                     canonical = reader_id + ":" + canonical
                 inserted = conn.execute("""INSERT OR IGNORE INTO articles(canonical_url,title,url,summary,source_id,
-                    source_name,category,published_at,fetched_at,image_url,reader_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    source_name,category,published_at,fetched_at,image_url,reader_id,media_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (canonical, article["title"], article["url"], article["summary"], source["id"],
-                     source["name"], source["category"], article["published_at"], utc_now(), article["image_url"], reader_id))
+                     source["name"], source["category"], article["published_at"], utc_now(), article["image_url"], reader_id, current["media_id"]))
                 if not inserted.rowcount:
                     continue
                 count += 1

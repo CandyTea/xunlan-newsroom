@@ -6,6 +6,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .catalog import load_catalog, reindex_topics
 
@@ -15,6 +16,24 @@ def utc_now():
 
 
 DEFAULT_SETTINGS = {"timezone": "Asia/Shanghai", "catch_up": True, "catch_up_hours": 4}
+
+
+def default_media_name(source):
+    host = (urlsplit(source["url"]).hostname or "").lower()
+    if host == "espn.com" or host.endswith(".espn.com"):
+        return "ESPN"
+    if host in ("feeds.bbci.co.uk", "bbc.co.uk", "bbc.com") or host.endswith(".bbc.co.uk"):
+        return "BBC"
+    if host == "theguardian.com" or host.endswith(".theguardian.com"):
+        return "The Guardian"
+    if host == "t.me" and urlsplit(source["url"]).path.rstrip("/").lower() == "/s/fabrizioromanotg":
+        return "罗马诺"
+    return source["name"]
+
+
+def ensure_media(conn, name):
+    conn.execute("INSERT OR IGNORE INTO media(name) VALUES(?)", (name,))
+    return conn.execute("SELECT id FROM media WHERE name=?", (name,)).fetchone()["id"]
 
 
 def load_default_sources():
@@ -49,9 +68,10 @@ def seed_default_sources(conn):
         exists = conn.execute("SELECT 1 FROM sources WHERE kind=? AND url=?",
                               (source["kind"], source["url"])).fetchone()
         if not exists:
-            conn.execute("INSERT INTO sources(name,kind,url,category,enabled,steam_appid) VALUES(?,?,?,?,?,?)",
+            media_id = ensure_media(conn, source["media_name"] or default_media_name(source))
+            conn.execute("INSERT INTO sources(name,kind,url,category,enabled,steam_appid,media_id) VALUES(?,?,?,?,?,?,?)",
                          (source["name"], source["kind"], source["url"], source["category"],
-                          int(source["enabled"]), source["steam_appid"]))
+                          int(source["enabled"]), source["steam_appid"], media_id))
         if key:
             conn.execute("INSERT INTO metadata(key,value) VALUES(?,'1')", (key,))
     conn.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES('sources_seeded','1')")
@@ -163,6 +183,27 @@ class Database:
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
             conn.executescript(READING_SCHEMA)
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS media (
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+                CREATE TABLE IF NOT EXISTS media_follows (
+                    reader_id TEXT NOT NULL, media_id INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+                    PRIMARY KEY(reader_id,media_id));
+            """)
+            for table in ("sources", "articles"):
+                columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if "media_id" not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN media_id INTEGER REFERENCES media(id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS articles_media ON articles(media_id,id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS sources_media ON sources(media_id,enabled)")
+            for source in conn.execute("SELECT * FROM sources WHERE media_id IS NULL").fetchall():
+                media_id = ensure_media(conn, default_media_name(source))
+                conn.execute("UPDATE sources SET media_id=? WHERE id=?", (media_id, source["id"]))
+            conn.execute("""UPDATE articles SET media_id=(SELECT media_id FROM sources WHERE sources.id=articles.source_id)
+                            WHERE media_id IS NULL AND source_id IS NOT NULL""")
+            for row in conn.execute("SELECT DISTINCT source_name FROM articles WHERE media_id IS NULL").fetchall():
+                media_id = ensure_media(conn, row["source_name"])
+                conn.execute("UPDATE articles SET media_id=? WHERE media_id IS NULL AND source_name=?", (media_id, row["source_name"]))
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS guest_sessions (
                     token_hash TEXT PRIMARY KEY, csrf_token TEXT NOT NULL, expires_at TEXT NOT NULL);

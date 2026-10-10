@@ -158,7 +158,7 @@ function sourceForm(source = {}) {
   const urlHint = el("small");
   const urlField = el("label", {}, [urlTitle, url, urlHint]);
   const steamField = field("Steam 游戏 App ID", appid, "可在商店地址 store.steampowered.com/app/数字 中找到。");
-  const form = el("form", { class: "modal-form" }, [field("来源名称", input("name", source.name || "", { required: true, maxlength: 120, placeholder: "为来源起一个名称" })), el("div", { class: "form-row" }, [field("来源类型", kind), field("所属栏目", select("category", CATEGORIES, source.category || "games"))]), urlField, steamField, check("enabled", "启用此来源", source.enabled !== false), footer(source.id ? "保存修改" : "添加来源")]);
+  const form = el("form", { class: "modal-form" }, [field("来源名称", input("name", source.name || "", { required: true, maxlength: 120, placeholder: "为来源起一个名称" })), field("媒体名称", input("media_name", source.media_name || "", { maxlength: 120, placeholder: "如：ESPN、罗马诺" }), "同一媒体的多个订阅填写相同名称，消息会汇集到同一个媒体页。留空时自动归属，编辑时保留原归属。"), el("div", { class: "form-row" }, [field("来源类型", kind), field("所属栏目", select("category", CATEGORIES, source.category || "games"))]), urlField, steamField, check("enabled", "启用此来源", source.enabled !== false), footer(source.id ? "保存修改" : "添加来源")]);
   function toggle() {
     const steam = kind.value === "steam"; const telegram = kind.value === "telegram";
     urlField.hidden = steam; url.disabled = steam; url.required = !steam;
@@ -171,7 +171,7 @@ function sourceForm(source = {}) {
   kind.addEventListener("change", toggle); toggle();
   form.addEventListener("submit", async event => {
     event.preventDefault(); const data = new FormData(form); const submit = $("[type=submit]", form); const steam = data.get("kind") === "steam";
-    const body = { name: data.get("name").trim(), kind: data.get("kind"), category: data.get("category"), enabled: data.has("enabled"), url: steam ? "" : data.get("url").trim() };
+    const body = { name: data.get("name").trim(), media_name: data.get("media_name").trim(), kind: data.get("kind"), category: data.get("category"), enabled: data.has("enabled"), url: steam ? "" : data.get("url").trim() };
     if (steam) body.steam_appid = Number(data.get("steam_appid"));
     if (!body.name) { formError(form, new Error("请输入来源名称。")); return; }
     if (!steam && body.kind !== "telegram") { try { const parsed = new URL(body.url); if (!["http:", "https:"].includes(parsed.protocol)) throw new Error(); } catch { formError(form, new Error("请输入有效的公开 HTTP / HTTPS 地址。")); return; } }

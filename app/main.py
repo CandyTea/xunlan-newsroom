@@ -20,10 +20,10 @@ from fastapi.staticfiles import StaticFiles
 from .collector import Collector, fetch_config, fetch_public, rematch_watch, resolve_public_url, watch_from_row
 from .browser import browser_cache_url, browser_source_allowed, browser_source_urls, parse_browser_feed
 from .content import ArticleReader, ContentError
-from .db import Database, utc_now
+from .db import Database, default_media_name, ensure_media, utc_now
 from .guests import GuestReaders
 from .dns import dns_mode
-from .models import ArticleHtml, ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, ReadingPreferences, Schedule, Settings, Setup, Source, TranslationRequest, TranslationSettings, Watch
+from .models import ArticleHtml, ArticlePatch, BrowserFeed, BrowserReport, CATEGORIES, Credentials, FetchRequest, MediaFollow, ReadingPreferences, Schedule, Settings, Setup, Source, TranslationRequest, TranslationSettings, Watch
 from .scheduler import Scheduler, next_run, schedule_from_row
 from .translation import PROVIDERS, TranslationError, Translator, needs_translation
 
@@ -119,7 +119,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
         await reader.stop()
         await guests.stop()
 
-    app = FastAPI(title="Newsroom", version="1.5.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Newsroom", version="1.6.0", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(BodyLimitMiddleware)
     app.state.db = db
     app.state.collector = collector
@@ -301,16 +301,42 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             raise HTTPException(404, "未找到该资讯")
         return row
 
-    def source_from_row(row):
+    def source_from_row(row, conn):
         value = dict(row)
         value["enabled"] = bool(value["enabled"])
+        media = conn.execute("SELECT name FROM media WHERE id=?", (value["media_id"],)).fetchone()
+        value["media_name"] = media["name"] if media else ""
         return value
+
+    def media_for_reader(conn, session, media_id=None):
+        scope = reader_id(session)
+        values = [scope, scope]
+        where = " WHERE m.id=?" if media_id is not None else ""
+        if media_id is not None:
+            values.append(media_id)
+        rows = conn.execute("""SELECT * FROM (
+            SELECT m.id,m.name,
+                (SELECT COUNT(*) FROM sources s WHERE s.media_id=m.id AND s.enabled=1) AS source_count,
+                (SELECT COUNT(*) FROM articles a WHERE a.media_id=m.id AND (a.reader_id='public' OR a.reader_id=?)) AS article_count,
+                EXISTS(SELECT 1 FROM media_follows f WHERE f.media_id=m.id AND f.reader_id=?) AS followed
+            FROM media m""" + where + """
+            ) WHERE source_count>0 OR article_count>0 OR followed=1
+            ORDER BY followed DESC,name COLLATE NOCASE,id""", values).fetchall()
+        return [{**dict(row), "followed": bool(row["followed"])} for row in rows]
+
+    def visible_media(conn, media_id, session):
+        items = media_for_reader(conn, session, media_id)
+        if not items:
+            raise HTTPException(404, "未找到该媒体")
+        return items[0]
 
     def article_from_row(conn, row, session, translation_config=None):
         value = dict(row)
         value.pop("canonical_url", None)
         value.pop("source_id", None)
         value.pop("reader_id", None)
+        media = conn.execute("SELECT name FROM media WHERE id=?", (value["media_id"],)).fetchone()
+        value["media_name"] = media["name"] if media else value["source_name"]
         if session.get("guest"):
             flags = conn.execute("SELECT saved,read FROM guest_article_state WHERE reader_id=? AND article_id=?",
                                  (reader_id(session), value["id"])).fetchone()
@@ -459,14 +485,40 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
             raise HTTPException(422, "翻译供应商无效")
         return {"models": await reading_services(session)[1].models(provider)}
 
+    @app.get("/api/media")
+    def media_list(session=Depends(require_reader)):
+        with db.connection() as conn:
+            return {"items": media_for_reader(conn, session)}
+
+    @app.get("/api/media/{media_id}")
+    def media_detail(media_id: int, session=Depends(require_reader)):
+        with db.connection() as conn:
+            return visible_media(conn, media_id, session)
+
+    @app.put("/api/media/{media_id}/follow")
+    def follow_media(media_id: int, body: MediaFollow, session=Depends(require_reader)):
+        with db.connection(write=True) as conn:
+            value = visible_media(conn, media_id, session)
+            if body.followed:
+                conn.execute("INSERT OR IGNORE INTO media_follows(reader_id,media_id) VALUES(?,?)", (reader_id(session), media_id))
+            else:
+                conn.execute("DELETE FROM media_follows WHERE reader_id=? AND media_id=?", (reader_id(session), media_id))
+            value["followed"] = body.followed
+            return value
+
     @app.get("/api/articles")
     def articles(category: str = "", q: str = Query("", max_length=200), following: bool = False,
                  saved: bool = False, unread: bool = False, watch_id: int | None = Query(None, gt=0),
                  company_id: int | None = Query(None, gt=0), league_id: str = Query("", max_length=80),
-                 team_id: str = Query("", max_length=80),
+                 team_id: str = Query("", max_length=80), media_id: int | None = Query(None, gt=0),
                  page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), session=Depends(require_reader)):
         conditions = ["(a.reader_id='public' OR a.reader_id=?)"]
         params = [reader_id(session)]
+        if media_id is not None:
+            with db.connection() as conn:
+                visible_media(conn, media_id, session)
+            conditions.append("a.media_id=?")
+            params.append(media_id)
         scope = reader_id(session)
         guest = bool(session.get("guest"))
         joins = " LEFT JOIN guest_article_state g ON g.article_id=a.id AND g.reader_id=?" if guest else ""
@@ -621,7 +673,7 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
     @app.get("/api/sources", dependencies=[Depends(require_admin)])
     def sources():
         with db.connection() as conn:
-            return {"items": [source_from_row(row) for row in conn.execute("SELECT * FROM sources ORDER BY category,id")]}
+            return {"items": [source_from_row(row, conn) for row in conn.execute("SELECT * FROM sources ORDER BY category,id")]}
 
     async def write_source(body, source_id=None):
         if body.kind != "telegram":
@@ -631,12 +683,19 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
                 raise HTTPException(422, "来源网址无法解析为允许的公网地址") from exc
         values = (body.name, body.kind, body.url, body.category, int(body.enabled), body.steam_appid)
         with db.connection(write=True) as conn:
-            if source_id is None:
-                source_id = conn.execute("INSERT INTO sources(name,kind,url,category,enabled,steam_appid) VALUES(?,?,?,?,?,?)", values).lastrowid
+            previous = ensure_row(conn, "sources", source_id) if source_id is not None else None
+            if body.media_name:
+                media_id = ensure_media(conn, body.media_name)
+            elif previous:
+                media_id = previous["media_id"]
             else:
-                ensure_row(conn, "sources", source_id)
-                conn.execute("UPDATE sources SET name=?,kind=?,url=?,category=?,enabled=?,steam_appid=?,last_error=NULL WHERE id=?", (*values, source_id))
-            return source_from_row(ensure_row(conn, "sources", source_id))
+                media_id = ensure_media(conn, default_media_name(body.model_dump()))
+            if source_id is None:
+                source_id = conn.execute("INSERT INTO sources(name,kind,url,category,enabled,steam_appid,media_id) VALUES(?,?,?,?,?,?,?)", (*values, media_id)).lastrowid
+            else:
+                conn.execute("UPDATE sources SET name=?,kind=?,url=?,category=?,enabled=?,steam_appid=?,media_id=?,last_error=NULL WHERE id=?", (*values, media_id, source_id))
+                conn.execute("UPDATE articles SET media_id=? WHERE source_id=?", (media_id, source_id))
+            return source_from_row(ensure_row(conn, "sources", source_id), conn)
 
     @app.post("/api/sources", dependencies=[Depends(require_admin)])
     async def add_source(body: Source):
@@ -795,7 +854,8 @@ def create_app(data_dir=None, start_scheduler=True, fetcher=fetch_public):
     @app.get("/api/export", dependencies=[Depends(require_admin)])
     def export(session=Depends(require_auth)):
         with db.connection() as conn:
-            return {"settings": db.settings(), "sources": [source_from_row(row) for row in conn.execute("SELECT * FROM sources ORDER BY id")],
+            return {"settings": db.settings(), "sources": [source_from_row(row, conn) for row in conn.execute("SELECT * FROM sources ORDER BY id")],
+                    "followed_media": [item for item in media_for_reader(conn, session) if item["followed"]],
                     "watches": [watch_from_row(row) for row in conn.execute("SELECT * FROM watches WHERE reader_id=? ORDER BY id", (reader_id(session),))], "schedules": schedules_list()}
 
     static = ROOT / "app" / "static"

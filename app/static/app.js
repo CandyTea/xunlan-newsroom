@@ -26,7 +26,7 @@ const ICONS = {
   warning: '<path d="m12 3 10 18H2zM12 9v5M12 17v.1"/>',
   chevron: '<path d="m9 5 7 7-7 7"/>',
 };
-const state = { session: null, view: "news", category: "", q: "", saved: false, unread: false, watchId: "", companyId: "", leagueId: "", teamId: "", sportsWatchId: "", page: 1, articles: [], total: 0, pageSize: 20, watches: [], catalog: { companies: [], leagues: [], teams: [] }, schedules: [], settings: { timezone: "Asia/Shanghai" }, status: {}, manageWatches: false, renderId: 0, modalId: 0, toastTimer: null, fetching: false, pollBusy: false };
+const state = { session: null, view: "news", followingMode: "objects", mediaId: "", media: [], category: "", q: "", saved: false, unread: false, watchId: "", companyId: "", leagueId: "", teamId: "", sportsWatchId: "", page: 1, articles: [], total: 0, pageSize: 20, watches: [], catalog: { companies: [], leagues: [], teams: [] }, schedules: [], settings: { timezone: "Asia/Shanghai" }, status: {}, manageWatches: false, renderId: 0, modalId: 0, toastTimer: null, fetching: false, pollBusy: false };
 const $ = (selector, root = document) => root.querySelector(selector);
 const main = $("#main-content");
 const modal = $("#modal");
@@ -35,6 +35,7 @@ const listTranslation = { controller: null, retryAfter: 0 };
 let articleContentController = null;
 
 function canRead() { return Boolean(state.session?.authenticated || state.session?.guest); }
+function isReaderView() { return state.view === "news" || (state.view === "following" && (state.followingMode === "objects" || Boolean(state.mediaId))); }
 
 function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
@@ -179,18 +180,19 @@ function showAuth() {
 }
 async function refreshData() {
   const session = state.session;
-  const results = await Promise.allSettled([api("/preferences"), api("/watches"), api("/status"), api("/catalog")]);
+  const results = await Promise.allSettled([api("/preferences"), api("/watches"), api("/status"), api("/catalog"), api("/media")]);
   if (!canRead() || state.session !== session) return;
   if (results[0].status === "fulfilled") state.settings = results[0].value;
   if (results[1].status === "fulfilled") state.watches = results[1].value.items || [];
   if (results[2].status === "fulfilled") state.status = results[2].value;
   if (results[3].status === "fulfilled") state.catalog = results[3].value;
+  if (results[4].status === "fulfilled") state.media = results[4].value.items || [];
   normalizeFocus();
   renderSidebar(); updateFetchButtons();
 }
 async function enterApp() {
   deviceNews.controller?.abort(); listTranslation.controller?.abort(); closeModal();
-  state.renderId += 1; state.articles = []; state.watches = []; state.schedules = []; state.status = {};
+  state.renderId += 1; state.articles = []; state.watches = []; state.media = []; state.mediaId = ""; state.schedules = []; state.status = {};
   state.settings = { timezone: "Asia/Shanghai" }; state.total = 0; state.fetching = false;
   deviceNews.lastAttempt = 0; listTranslation.retryAfter = 0;
   main.replaceChildren(loading());
@@ -229,7 +231,10 @@ async function collectDeviceFeeds(categories, session, controller) {
       catch (error) { if (error.status === 401 || controller.signal.aborted) return []; }
     }
     await refreshData();
-    if (result.newCount && !document.hidden && ["news", "following"].includes(state.view) && !state.manageWatches && !modal.open) await renderReader(++state.renderId, true);
+    if (result.newCount && !document.hidden && !state.manageWatches && !modal.open) {
+      if (isReaderView()) await renderReader(++state.renderId, true);
+      else if (state.view === "following" && state.followingMode === "media") await renderMediaList(++state.renderId);
+    }
     return result.sourceIds;
   } catch {
     controller.abort();
@@ -237,18 +242,26 @@ async function collectDeviceFeeds(categories, session, controller) {
   }
 }
 function route() {
-  const next = location.hash.slice(1); state.view = ["news", "following", "schedules", "settings"].includes(next) ? next : "news";
+  const next = location.hash.slice(1); const mediaRoute = /^media\/([1-9]\d*)$/.exec(next);
+  state.mediaId = mediaRoute ? mediaRoute[1] : "";
+  state.followingMode = next === "following/media" || mediaRoute ? "media" : "objects";
+  state.view = state.followingMode === "media" ? "following" : ["news", "following", "schedules", "settings"].includes(next) ? next : "news";
   state.page = 1; state.watchId = ""; state.q = ""; state.saved = false; state.unread = false; state.manageWatches = false;
   if (state.view === "news") restoreFocus(); else state.category = "";
+  if (state.mediaId) { state.companyId = ""; state.leagueId = ""; state.teamId = ""; state.sportsWatchId = ""; }
+  document.title = `${{ news: "新闻", following: "我的关注", schedules: "收取计划", settings: "设置" }[state.view]} · 讯览`;
   closeModal(); renderView();
   document.querySelectorAll("[data-view]").forEach(link => { if (link.dataset.view === state.view) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current"); });
-  document.title = `${{ news: "新闻", following: "我的关注", schedules: "收取计划", settings: "设置" }[state.view]} · 讯览`;
 }
 async function renderView() {
   if (!canRead()) return;
   listTranslation.controller?.abort();
   const id = ++state.renderId;
-  if (state.view === "news" || state.view === "following") { if (state.manageWatches) return renderWatches(id); return renderReader(id); }
+  if (state.view === "news" || state.view === "following") {
+    if (state.view === "following" && state.followingMode === "media" && !state.mediaId) return renderMediaList(id);
+    if (state.manageWatches) return renderWatches(id);
+    return renderReader(id);
+  }
   if (state.view === "schedules") return renderSchedules(id);
   return renderSettings(id);
 }
@@ -328,7 +341,62 @@ function sportsFocusBar() {
   const addCurrent = current ? button(already ? "已关注" : `关注${current.name}`, () => watchForm({ ...current, id: undefined, type, league_id: type === "team" ? current.league_id : current.id, enabled: true }), "button button-small", "bookmark", { disabled: Boolean(already) }) : null;
   return el("section", { class: "focus-bar sports-focus", "aria-label": "体育焦点" }, [el("div", { class: "focus-fields" }, [formField("联赛", leagueSelect), formField("常用球队", teamSelect)]), el("div", { class: "focus-actions" }, [addCurrent, button("添加球队", () => watchForm({ type: "team", league_id: state.leagueId, enabled: true }, saved => setFocus({ teamId: "", sportsWatchId: String(saved.id) })), "button button-small", "plus")]), el("p", { class: "focus-hint", text: customLeague ? "当前按已关注联赛匹配；也可切换到上方预设联赛浏览常用球队。" : "常用球队仅供快捷选择；更多球队可以自行添加。" })]);
 }
+function openMedia(mediaId) {
+  closeModal();
+  const target = `#media/${mediaId}`;
+  if (location.hash === target) route(); else location.hash = target;
+}
+function mediaSource(article) {
+  const name = article.media_name || article.source_name || "原始来源";
+  return article.media_id ? button(name, () => openMedia(article.media_id), "media-source-link", null, { "aria-label": `查看${name}的全部消息` }) : el("span", { text: name });
+}
+function followingTabs() {
+  return el("nav", { class: "following-tabs", "aria-label": "关注类型" }, [
+    button("关注对象", () => { location.hash = "following"; }, "", null, { "aria-pressed": String(state.followingMode === "objects") }),
+    button("关注媒体", () => { location.hash = "following/media"; }, "", null, { "aria-pressed": String(state.followingMode === "media") }),
+  ]);
+}
+function mediaFollowButton(media) {
+  const control = button(media.followed ? "取消关注" : "关注", async () => {
+    control.disabled = true;
+    const id = state.renderId;
+    try {
+      const updated = await api(`/media/${media.id}/follow`, { method: "PUT", body: { followed: !media.followed } });
+      Object.assign(media, updated);
+      control.textContent = updated.followed ? "取消关注" : "关注";
+      control.setAttribute("aria-pressed", String(updated.followed));
+      control.setAttribute("aria-label", `${updated.followed ? "取消关注" : "关注"}${updated.name}`);
+      control.className = updated.followed ? "button button-small" : "button button-small button-primary";
+      const index = state.media.findIndex(item => item.id === updated.id);
+      if (index >= 0) state.media[index] = updated; else state.media.push(updated);
+      renderSidebar(); toast(updated.followed ? `已关注${updated.name}` : `已取消关注${updated.name}`);
+      if (id === state.renderId) await renderView();
+    } catch (error) { showError(error); }
+    finally { control.disabled = false; }
+  }, media.followed ? "button button-small" : "button button-small button-primary", null, { "aria-pressed": String(media.followed), "aria-label": `${media.followed ? "取消关注" : "关注"}${media.name}` });
+  return control;
+}
+async function renderMediaList(id) {
+  listTranslation.controller?.abort(); state.articles = [];
+  const content = el("div", { class: "media-directory", "aria-live": "polite" }, loading("正在载入媒体…"));
+  main.replaceChildren(heading("我的关注", "关注媒体，集中阅读它的消息。"), followingTabs(), content);
+  try {
+    const data = await api("/media"); if (id !== state.renderId) return;
+    state.media = data.items || []; renderSidebar();
+    const followed = state.media.filter(media => media.followed);
+    const available = state.media.filter(media => !media.followed);
+    const row = media => el("article", { class: "media-row" }, [
+      el("div", { class: "media-copy" }, [el("h3", {}, button(media.name, () => openMedia(media.id), "media-name")), el("p", { text: `${media.article_count} 条资讯${media.source_count ? ` · ${media.source_count} 个订阅` : ""}` })]),
+      el("div", { class: "media-actions" }, [button("查看消息", () => openMedia(media.id), "button button-small"), mediaFollowButton(media)]),
+    ]);
+    const group = (title, items) => el("section", { class: "media-group" }, [el("h2", { text: title }), el("div", { class: "media-list" }, items.map(row))]);
+    content.replaceChildren(followed.length ? group("已关注媒体", followed) : el("p", { class: "media-empty", text: "选择下面的媒体进行关注，之后可以随时点名称阅读它的消息。" }));
+    if (available.length) content.append(group("可关注媒体", available));
+    if (!state.media.length) content.replaceChildren(empty("还没有可浏览的媒体", "配置资讯来源后，媒体会出现在这里。"));
+  } catch (error) { if (id === state.renderId && error.status !== 401) content.replaceChildren(errorPanel(error, renderView)); }
+}
 function readerEmpty() {
+  if (state.mediaId) return empty("这个媒体暂无符合条件的资讯", state.q || state.saved || state.unread || state.category ? "可以清除筛选，查看这个媒体已收取的全部消息。" : "收取新资讯后，这个媒体的消息会显示在这里。", [button("收取资讯", () => requestFetch(), "button button-primary", "refresh"), button("清除筛选", clearFilters, "button button-small")]);
   if (state.category === "sports" && !state.q && !state.saved && !state.unread) return empty("还没有符合条件的体育资讯", "尚未收取到相关报道。可以收取新资讯，或清除联赛与球队筛选后查看全部报道。", [button("收取资讯", () => requestFetch(), "button button-primary", "refresh"), button("清除筛选", clearFilters, "button button-small")]);
   if (state.q || state.saved || state.unread || state.watchId || state.category || (state.view === "news" && (state.companyId || state.leagueId || state.teamId || state.sportsWatchId))) return empty("还没有符合条件的资讯", "试试其他栏目、公司或球队，也可以清除筛选查看已收取的全部资讯。", [button("清除筛选", clearFilters, "button button-small")]);
   if (state.view === "following") return empty(state.watches.length ? "等待你的关注资讯" : "从一个关注对象开始", state.watches.length ? "目前还没有资讯命中关注对象。收取新资讯，或编辑别名与上下文关键词来调整匹配。" : "添加公司、工作室、球队、国家或政客。讯览会从真实资讯中找出相关报道。", [button(state.watches.length ? "管理关注" : "添加关注", () => state.watches.length ? showWatchManager() : watchForm(), "button button-primary", "plus"), state.watches.length && button("收取资讯", () => requestFetch(), "button", "refresh")].filter(Boolean), "bookmark");
@@ -336,9 +404,19 @@ function readerEmpty() {
 }
 async function renderReader(id, quiet = false) {
   listTranslation.controller?.abort();
-  const following = state.view === "following";
+  const publisher = Boolean(state.mediaId);
+  let media = publisher ? state.media.find(item => String(item.id) === state.mediaId) : null;
+  if (publisher && !media) {
+    if (!quiet) main.replaceChildren(loading("正在载入媒体…"));
+    try {
+      media = await api(`/media/${state.mediaId}`); if (id !== state.renderId) return;
+      state.media.push(media);
+    } catch (error) { if (id === state.renderId) main.replaceChildren(errorPanel(error, renderView)); return; }
+  }
+  const following = state.view === "following" && !publisher;
   const subtitle = following ? "从已收取的资讯中，找到你关心的人和事。" : "按栏目阅读，按兴趣关注。";
-  const head = heading(following ? "我的关注" : "今日资讯", subtitle, following ? [button("管理关注", showWatchManager, "button", "edit")] : []);
+  const head = publisher ? heading(media.name, "这个媒体已收取的全部消息，按发布时间排序。", [button("返回媒体", () => { location.hash = "following/media"; }, "button"), mediaFollowButton(media)]) : heading(following ? "我的关注" : "今日资讯", subtitle, following ? [button("管理关注", showWatchManager, "button", "edit")] : [button("关注媒体", () => { location.hash = "following/media"; }, "button")]);
+  if (publisher) document.title = `${media.name} · 讯览`;
   const categories = el("nav", { class: "category-tabs", "aria-label": "资讯栏目" }, Object.entries({ "": "全部", ...CATEGORIES }).map(([key, name]) => button(name, () => setFilter("category", key), "", null, { "aria-pressed": String(state.category === key) })));
   const search = el("form", { class: "search-form", role: "search", onsubmit: event => { event.preventDefault(); setFilter("q", $("input", search).value.trim()); } }, [input("q", state.q, { type: "search", placeholder: "搜索标题与摘要", "aria-label": "搜索资讯", maxlength: 200 }), el("button", { class: "icon-button", type: "submit", "aria-label": "搜索" }, icon("search"))]);
   const filters = el("div", { class: "reader-filters" }, [button("未读", () => setFilter("unread", !state.unread), "filter-button", "eye", { "aria-pressed": String(state.unread) }), button("已收藏", () => setFilter("saved", !state.saved), "filter-button", "bookmark", { "aria-pressed": String(state.saved) })]);
@@ -349,11 +427,20 @@ async function renderReader(id, quiet = false) {
   }
   const list = quiet ? $("#reader-list") : el("div", { id: "reader-list", "aria-live": "polite" }, loading("正在载入资讯…"));
   if (!list) return;
-  if (!quiet) main.replaceChildren(head, following && !state.watches.length ? el("div", { class: "following-intro" }, [el("p", {}, [el("strong", { text: "还没有关注对象" }), " · 添加关注后，相关资讯会出现在这里。"]), button("添加", () => watchForm(), "button button-small", "plus")]) : "", categories, !following && focusBar(), tools, list);
+  if (!quiet) main.replaceChildren(...[
+    head,
+    state.view === "following" ? followingTabs() : null,
+    following && !state.watches.length ? el("div", { class: "following-intro" }, [el("p", {}, [el("strong", { text: "还没有关注对象" }), " · 添加关注后，相关资讯会出现在这里。"]), button("添加", () => watchForm(), "button button-small", "plus")]) : null,
+    categories,
+    !following && !publisher ? focusBar() : null,
+    tools,
+    list,
+  ].filter(Boolean));
   try {
     const params = new URLSearchParams({ page: String(state.page), page_size: String(state.pageSize), following: String(following), saved: String(state.saved), unread: String(state.unread) });
     if (state.category) params.set("category", state.category); if (state.q) params.set("q", state.q); if (state.watchId) params.set("watch_id", state.watchId);
-    if (!following) {
+    if (publisher) params.set("media_id", state.mediaId);
+    if (!following && !publisher) {
       if (state.category === "sports") {
         if (state.sportsWatchId) params.set("watch_id", state.sportsWatchId);
         else { if (state.leagueId) params.set("league_id", state.leagueId); if (state.teamId) params.set("team_id", state.teamId); }
@@ -375,7 +462,7 @@ function articleRow(article) {
   const translated = state.settings.translation?.ready && state.settings.translation.auto_translate_list && article.translation;
   const display = translated || article;
   const title = el("h2", {}, button(display.title || "无标题资讯", () => articleDetail(article.id), "article-link"));
-  const meta = el("div", { class: "news-meta" }, [el("span", { class: "news-category", text: CATEGORIES[article.category] || "资讯" }), el("span", { class: "meta-divider", text: "·" }), el("span", { text: article.source_name || "原始来源" }), el("span", { class: "meta-divider", text: "·" }), el("time", { datetime: article.published_at || article.fetched_at, text: articleTime(article.published_at) })]);
+  const meta = el("div", { class: "news-meta" }, [el("span", { class: "news-category", text: CATEGORIES[article.category] || "资讯" }), el("span", { class: "meta-divider", text: "·" }), mediaSource(article), el("span", { class: "meta-divider", text: "·" }), el("time", { datetime: article.published_at || article.fetched_at, text: articleTime(article.published_at) })]);
   const save = button(article.saved ? "已收藏" : "收藏", async event => {
     event.stopPropagation(); save.disabled = true;
     try { const updated = await api(`/articles/${article.id}`, { method: "PATCH", body: { saved: !article.saved } }); article.saved = typeof updated.saved === "boolean" ? updated.saved : !article.saved; save.replaceChildren(icon("bookmark"), article.saved ? "已收藏" : "收藏"); save.setAttribute("aria-pressed", String(article.saved)); toast(article.saved ? "已加入收藏" : "已取消收藏"); if (state.saved && !article.saved) renderView(); }
@@ -391,7 +478,7 @@ function articleRow(article) {
 async function autoTranslateList(id) {
   const preferences = state.settings.translation;
   if (listTranslation.controller && !listTranslation.controller.signal.aborted) return;
-  if (!canRead() || $("#app").hidden || !["news", "following"].includes(state.view) || state.manageWatches) return;
+  if (!canRead() || $("#app").hidden || !isReaderView() || state.manageWatches) return;
   if (!preferences?.ready || !preferences.auto_translate_list || document.hidden || Date.now() < listTranslation.retryAfter) return;
   const pending = state.articles.filter(article => article.needs_translation && !article.translation);
   if (!pending.length) return;
@@ -434,7 +521,7 @@ async function articleDetail(id) {
     const sourceUrl = safeUrl(article.url);
     const title = el("h1", { text: article.title || "无标题资讯" });
     const summary = el("p", { text: article.summary || "该来源未提供摘要，请前往原文阅读。" });
-    const detail = el("article", { class: "article-detail" }, [el("p", { class: "article-kicker", text: CATEGORIES[article.category] || "资讯" }), title, el("div", { class: "news-meta" }, [el("span", { text: article.source_name || "原始来源" }), el("span", { class: "meta-divider", text: "·" }), el("time", { datetime: article.published_at, text: article.published_at ? dateTime(article.published_at, { year: "numeric" }) : "发布时间未提供" })])]);
+    const detail = el("article", { class: "article-detail" }, [el("p", { class: "article-kicker", text: CATEGORIES[article.category] || "资讯" }), title, el("div", { class: "news-meta" }, [mediaSource(article), el("span", { class: "meta-divider", text: "·" }), el("time", { datetime: article.published_at, text: article.published_at ? dateTime(article.published_at, { year: "numeric" }) : "发布时间未提供" })])]);
     const imageUrl = safeUrl(article.image_url); if (imageUrl) detail.append(el("img", { src: imageUrl, alt: "", referrerpolicy: "no-referrer", onerror: event => event.target.remove() }));
     const summarySection = el("section", { class: "article-summary" }, [el("h3", { text: "来源摘要" }), summary]);
     const bodySection = el("section", { class: "article-body", "aria-label": "新闻正文" }, el("p", { class: "field-caption", role: "status", text: "正在载入正文…" }));
@@ -744,9 +831,11 @@ function renderSidebar() {
   const status = state.status;
   const fetch = button(status.fetching ? "正在收取…" : "立即收取", () => requestFetch(), "button", "refresh", { disabled: Boolean(status.fetching), "data-fetch-button": true });
   const runtime = el("section", { class: "aside-section" }, [el("h2", { class: "aside-title", text: "阅读室" }), statusLine("refresh", "收取状态", status.fetching ? "收取中" : "已就绪"), statusLine("clock", "最近更新", status.last_success_at ? dateTime(status.last_success_at) : "尚未收取"), statusLine("calendar", "下次收取", status.next_run_at ? dateTime(status.next_run_at) : "未设置计划"), fetch]);
-  const watches = el("section", { class: "aside-section" }, [el("h2", { class: "aside-title", text: "关注线索" }), state.watches.length ? el("div", {}, state.watches.filter(w => w.enabled).slice(0, 5).map(w => el("div", { class: "aside-watch" }, [el("span", { text: w.name }), el("small", { text: WATCH_TYPES[w.type] || "" })]))) : el("p", { class: "aside-description", text: "添加你关心的公司、工作室、球队、国家或政客。相关资讯会汇集到「关注」。" }), button(state.watches.length ? "查看关注" : "添加关注", () => { if (!state.watches.length) watchForm(); else if (state.view === "following") showWatchManager(); else location.hash = "following"; }, "button button-small", state.watches.length ? "arrow" : "plus")]);
+  const watches = el("section", { class: "aside-section" }, [el("h2", { class: "aside-title", text: "关注线索" }), state.watches.length ? el("div", {}, state.watches.filter(w => w.enabled).slice(0, 5).map(w => el("div", { class: "aside-watch" }, [el("span", { text: w.name }), el("small", { text: WATCH_TYPES[w.type] || "" })]))) : el("p", { class: "aside-description", text: "添加你关心的公司、工作室、球队、国家或政客。相关资讯会汇集到「关注」。" }), button(state.watches.length ? "查看关注" : "添加关注", () => { if (!state.watches.length) watchForm(); else if (state.view === "following" && state.followingMode === "objects") showWatchManager(); else location.hash = "following"; }, "button button-small", state.watches.length ? "arrow" : "plus")]);
+  const followedMedia = state.media.filter(media => media.followed);
+  const mediaSection = el("section", { class: "aside-section" }, [el("h2", { class: "aside-title", text: "关注媒体" }), followedMedia.length ? el("div", { class: "aside-media-list" }, followedMedia.slice(0, 6).map(media => button(media.name, () => openMedia(media.id), "aside-media-link"))) : el("p", { class: "aside-description", text: "关注罗马诺、ESPN 等媒体，点名称集中阅读消息。" }), button("查看媒体", () => { location.hash = "following/media"; }, "button button-small", "arrow")]);
   const note = el("section", { class: "aside-section aside-note" }, ["为关注的事，", el("br"), "留一段阅读时间。", el("small", { text: `公开来源 · 原文可追溯\u2002\u2002${state.settings.timezone}` })]);
-  $("#sidebar").replaceChildren(runtime, watches, note);
+  $("#sidebar").replaceChildren(runtime, mediaSection, watches, note);
 }
 function updateFetchButtons() {
   const busy = Boolean(state.status.fetching || state.fetching);
@@ -776,7 +865,11 @@ async function pollStatus() {
     const wasFetching = Boolean(state.status.fetching); state.status = await api("/status"); renderSidebar(); updateFetchButtons();
     if (!wasFetching && state.status.fetching && !state.fetching && Date.now() - deviceNews.lastAttempt > 60000) collectDeviceNews();
     if (wasFetching && !state.status.fetching) {
-      if (["news", "following"].includes(state.view) && !state.manageWatches && !modal.open) renderReader(++state.renderId, true);
+      await refreshData();
+      if (!state.manageWatches && !modal.open) {
+        if (isReaderView()) renderReader(++state.renderId, true);
+        else if (state.view === "following" && state.followingMode === "media") renderMediaList(++state.renderId);
+      }
     }
     if (!deviceNews.busy && !state.fetching && Date.now() - deviceNews.lastAttempt >= 15 * 60000) collectDeviceNews();
   } catch (error) { if (error.status === 401) showAuth(); } finally { state.pollBusy = false; }

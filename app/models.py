@@ -93,6 +93,7 @@ class Schedule(StrictModel):
 
 class Source(StrictModel):
     name: str = Field(min_length=1, max_length=120)
+    media_name: str = Field(default="", max_length=120)
     kind: Literal["rss", "steam", "telegram"] = "rss"
     url: str = Field(default="", max_length=2048)
     category: Category
@@ -102,6 +103,7 @@ class Source(StrictModel):
     @model_validator(mode="after")
     def validate_source(self):
         self.name = self.name.strip()
+        self.media_name = self.media_name.strip()
         if not self.name:
             raise ValueError("来源名称不能为空")
         if self.kind == "steam":
@@ -115,6 +117,10 @@ class Source(StrictModel):
             self.url = public_url_syntax(self.url)
             self.steam_appid = None
         return self
+
+
+class MediaFollow(StrictModel):
+    followed: bool
 
 
 class Settings(StrictModel):
