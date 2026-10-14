@@ -1,27 +1,27 @@
 {
-  "updated_at": "2026-10-13T21:31:07.088321+00:00",
+  "updated_at": "2026-10-14T00:35:19.434043+00:00",
   "sources": [
     {
       "source_url": "https://feeds.bbci.co.uk/news/world/rss.xml",
       "status": "success",
-      "item_count": 26,
-      "fetched_at": "2026-10-13T21:31:03.345532+00:00",
+      "item_count": 23,
+      "fetched_at": "2026-10-14T00:35:16.667927+00:00",
       "route": "rss",
       "route_errors": []
     },
     {
       "source_url": "https://feeds.bbci.co.uk/sport/football/rss.xml",
       "status": "success",
-      "item_count": 70,
-      "fetched_at": "2026-10-13T21:30:57.986057+00:00",
+      "item_count": 74,
+      "fetched_at": "2026-10-14T00:35:15.349722+00:00",
       "route": "rss",
       "route_errors": []
     },
     {
       "source_url": "https://feeds.bbci.co.uk/sport/rss.xml",
       "status": "success",
-      "item_count": 64,
-      "fetched_at": "2026-10-13T21:30:57.713111+00:00",
+      "item_count": 71,
+      "fetched_at": "2026-10-14T00:35:15.365549+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -29,7 +29,7 @@
       "source_url": "https://t.me/s/fabrizioromanotg",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-13T21:31:02.726802+00:00",
+      "fetched_at": "2026-10-14T00:35:16.167519+00:00",
       "route": "telegram-public-preview",
       "route_errors": []
     },
@@ -37,15 +37,15 @@
       "source_url": "https://www.espn.com/espn/rss/nba/news",
       "status": "success",
       "item_count": 6,
-      "fetched_at": "2026-10-13T21:30:57.860765+00:00",
+      "fetched_at": "2026-10-14T00:35:15.285796+00:00",
       "route": "espn-public-api",
       "route_errors": []
     },
     {
       "source_url": "https://www.espn.com/espn/rss/news",
       "status": "success",
-      "item_count": 17,
-      "fetched_at": "2026-10-13T21:30:58.137839+00:00",
+      "item_count": 18,
+      "fetched_at": "2026-10-14T00:35:15.397885+00:00",
       "route": "espn-public-api",
       "route_errors": []
     },
@@ -53,7 +53,7 @@
       "source_url": "https://www.ftchinese.com/rss/feed",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-13T21:31:02.998162+00:00",
+      "fetched_at": "2026-10-14T00:35:16.420782+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -61,7 +61,7 @@
       "source_url": "https://www.theguardian.com/business/rss",
       "status": "success",
       "item_count": 19,
-      "fetched_at": "2026-10-13T21:31:03.239648+00:00",
+      "fetched_at": "2026-10-14T00:35:16.478300+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -69,7 +69,7 @@
       "source_url": "https://www.theguardian.com/football/premierleague/rss",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-13T21:30:58.097740+00:00",
+      "fetched_at": "2026-10-14T00:35:15.559743+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -77,7 +77,7 @@
       "source_url": "https://www.theguardian.com/football/realmadrid/rss",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-13T21:30:58.372692+00:00",
+      "fetched_at": "2026-10-14T00:35:15.551184+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -85,7 +85,7 @@
       "source_url": "https://www.theguardian.com/world/rss",
       "status": "success",
       "item_count": 45,
-      "fetched_at": "2026-10-13T21:31:03.432592+00:00",
+      "fetched_at": "2026-10-14T00:35:16.717662+00:00",
       "route": "rss",
       "route_errors": []
     },
