@@ -1,27 +1,27 @@
 {
-  "updated_at": "2026-10-16T18:19:30.759556+00:00",
+  "updated_at": "2026-10-16T21:39:41.127258+00:00",
   "sources": [
     {
       "source_url": "https://feeds.bbci.co.uk/news/world/rss.xml",
       "status": "success",
       "item_count": 36,
-      "fetched_at": "2026-10-16T18:19:28.294997+00:00",
+      "fetched_at": "2026-10-16T21:39:40.957011+00:00",
       "route": "rss",
       "route_errors": []
     },
     {
       "source_url": "https://feeds.bbci.co.uk/sport/football/rss.xml",
       "status": "success",
-      "item_count": 86,
-      "fetched_at": "2026-10-16T18:19:26.186497+00:00",
+      "item_count": 89,
+      "fetched_at": "2026-10-16T21:39:40.060159+00:00",
       "route": "rss",
       "route_errors": []
     },
     {
       "source_url": "https://feeds.bbci.co.uk/sport/rss.xml",
       "status": "success",
-      "item_count": 79,
-      "fetched_at": "2026-10-16T18:19:25.882903+00:00",
+      "item_count": 76,
+      "fetched_at": "2026-10-16T21:39:39.867096+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -29,7 +29,7 @@
       "source_url": "https://t.me/s/fabrizioromanotg",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-16T18:19:27.064584+00:00",
+      "fetched_at": "2026-10-16T21:39:40.808029+00:00",
       "route": "telegram-public-preview",
       "route_errors": []
     },
@@ -37,7 +37,7 @@
       "source_url": "https://www.espn.com/espn/rss/nba/news",
       "status": "success",
       "item_count": 6,
-      "fetched_at": "2026-10-16T18:19:26.126813+00:00",
+      "fetched_at": "2026-10-16T21:39:39.724253+00:00",
       "route": "espn-public-api",
       "route_errors": []
     },
@@ -45,7 +45,7 @@
       "source_url": "https://www.espn.com/espn/rss/news",
       "status": "success",
       "item_count": 18,
-      "fetched_at": "2026-10-16T18:19:26.478893+00:00",
+      "fetched_at": "2026-10-16T21:39:39.956299+00:00",
       "route": "espn-public-api",
       "route_errors": []
     },
@@ -53,7 +53,7 @@
       "source_url": "https://www.ftchinese.com/rss/feed",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-16T18:19:27.839898+00:00",
+      "fetched_at": "2026-10-16T21:39:40.850909+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -61,7 +61,7 @@
       "source_url": "https://www.theguardian.com/business/rss",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-16T18:19:28.067716+00:00",
+      "fetched_at": "2026-10-16T21:39:41.126674+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -69,7 +69,7 @@
       "source_url": "https://www.theguardian.com/football/premierleague/rss",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-16T18:19:26.450386+00:00",
+      "fetched_at": "2026-10-16T21:39:40.128325+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -77,7 +77,7 @@
       "source_url": "https://www.theguardian.com/football/realmadrid/rss",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-16T18:19:26.668795+00:00",
+      "fetched_at": "2026-10-16T21:39:40.362200+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -85,21 +85,25 @@
       "source_url": "https://www.theguardian.com/world/rss",
       "status": "success",
       "item_count": 45,
-      "fetched_at": "2026-10-16T18:19:28.422725+00:00",
+      "fetched_at": "2026-10-16T21:39:40.971535+00:00",
       "route": "rss",
       "route_errors": []
     },
     {
       "source_url": "https://x.com/elonmusk",
-      "status": "failed",
-      "error": "免费 X 来源暂时不可用，已保存的动态不受影响，可稍后重试",
-      "retained_previous": true
+      "status": "success",
+      "item_count": 100,
+      "fetched_at": "2026-10-16T21:39:40.564767+00:00",
+      "route": "x-public-page",
+      "route_errors": []
     },
     {
       "source_url": "https://x.com/thsottiaux",
-      "status": "failed",
-      "error": "免费 X 来源暂时不可用，已保存的动态不受影响，可稍后重试",
-      "retained_previous": true
+      "status": "success",
+      "item_count": 99,
+      "fetched_at": "2026-10-16T21:39:40.908883+00:00",
+      "route": "x-public-page",
+      "route_errors": []
     }
   ]
 }
