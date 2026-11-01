@@ -1,11 +1,11 @@
 {
-  "updated_at": "2026-10-31T23:40:23.772200+00:00",
+  "updated_at": "2026-11-01T05:52:45.606804+00:00",
   "sources": [
     {
       "source_url": "https://feeds.bbci.co.uk/news/world/rss.xml",
       "status": "success",
       "item_count": 28,
-      "fetched_at": "2026-10-31T23:40:23.076204+00:00",
+      "fetched_at": "2026-11-01T05:52:42.347299+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -13,7 +13,7 @@
       "source_url": "https://feeds.bbci.co.uk/sport/football/rss.xml",
       "status": "success",
       "item_count": 72,
-      "fetched_at": "2026-10-31T23:40:22.013575+00:00",
+      "fetched_at": "2026-11-01T05:52:41.048156+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -21,7 +21,7 @@
       "source_url": "https://feeds.bbci.co.uk/sport/rss.xml",
       "status": "success",
       "item_count": 72,
-      "fetched_at": "2026-10-31T23:40:21.721521+00:00",
+      "fetched_at": "2026-11-01T05:52:40.796462+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -29,7 +29,7 @@
       "source_url": "https://t.me/s/fabrizioromanotg",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-31T23:40:22.647700+00:00",
+      "fetched_at": "2026-11-01T05:52:41.731861+00:00",
       "route": "telegram-public-preview",
       "route_errors": []
     },
@@ -37,7 +37,7 @@
       "source_url": "https://www.espn.com/espn/rss/nba/news",
       "status": "success",
       "item_count": 6,
-      "fetched_at": "2026-10-31T23:40:21.777109+00:00",
+      "fetched_at": "2026-11-01T05:52:40.964108+00:00",
       "route": "espn-public-api",
       "route_errors": []
     },
@@ -45,7 +45,7 @@
       "source_url": "https://www.espn.com/espn/rss/news",
       "status": "success",
       "item_count": 18,
-      "fetched_at": "2026-10-31T23:40:21.874080+00:00",
+      "fetched_at": "2026-11-01T05:52:41.255348+00:00",
       "route": "espn-public-api",
       "route_errors": []
     },
@@ -53,7 +53,7 @@
       "source_url": "https://www.ftchinese.com/rss/feed",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-31T23:40:22.842583+00:00",
+      "fetched_at": "2026-11-01T05:52:41.979063+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -61,7 +61,7 @@
       "source_url": "https://www.theguardian.com/business/rss",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-31T23:40:23.011985+00:00",
+      "fetched_at": "2026-11-01T05:52:42.231002+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -69,7 +69,7 @@
       "source_url": "https://www.theguardian.com/football/premierleague/rss",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-31T23:40:22.167148+00:00",
+      "fetched_at": "2026-11-01T05:52:41.203828+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -77,7 +77,7 @@
       "source_url": "https://www.theguardian.com/football/realmadrid/rss",
       "status": "success",
       "item_count": 20,
-      "fetched_at": "2026-10-31T23:40:22.376457+00:00",
+      "fetched_at": "2026-11-01T05:52:41.664197+00:00",
       "route": "rss",
       "route_errors": []
     },
@@ -85,25 +85,21 @@
       "source_url": "https://www.theguardian.com/world/rss",
       "status": "success",
       "item_count": 45,
-      "fetched_at": "2026-10-31T23:40:23.117065+00:00",
+      "fetched_at": "2026-11-01T05:52:42.440129+00:00",
       "route": "rss",
       "route_errors": []
     },
     {
       "source_url": "https://x.com/elonmusk",
-      "status": "success",
-      "item_count": 100,
-      "fetched_at": "2026-10-31T23:40:23.599568+00:00",
-      "route": "x-public-page",
-      "route_errors": []
+      "status": "failed",
+      "error": "免费 X 来源暂时不可用，已保存的动态不受影响，可稍后重试",
+      "retained_previous": true
     },
     {
       "source_url": "https://x.com/thsottiaux",
-      "status": "success",
-      "item_count": 99,
-      "fetched_at": "2026-10-31T23:40:23.766976+00:00",
-      "route": "x-public-page",
-      "route_errors": []
+      "status": "failed",
+      "error": "免费 X 来源暂时不可用，已保存的动态不受影响，可稍后重试",
+      "retained_previous": true
     }
   ]
 }
